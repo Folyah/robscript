@@ -1,0 +1,2157 @@
+-- Robscript Team - Cambria Creature Survival ESP
+-- Game: [NEW MAP] Cambria - Creature Survival | placeId 116361821294893 | groupId 1047602881
+-- Window: RightControl | Panic: End | API: getgenv().RobScriptCambria
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local LocalPlayer = Players.LocalPlayer
+
+-- Unload a previous copy first, so its loops, billboards and highlights die.
+do
+	local existing = getgenv().RobScriptCambria
+	if type(existing) == "table" and type(existing.Destroy) == "function" then
+		pcall(existing.Destroy)
+	end
+end
+
+----- Library -----
+
+local LIBRARY_URLS = {
+	"https://raw.githubusercontent.com/bobloscript/Robly_Airflow/main/Source.luau",
+	"https://raw.githubusercontent.com/PookiePepelsss/Airflow-UI/refs/heads/main/Source.luau",
+}
+
+local Airflow
+for _, url in ipairs(LIBRARY_URLS) do
+	local ok, library = pcall(function()
+		return loadstring(game:HttpGet(url))()
+	end)
+	if ok and type(library) == "table" and type(library.CreateWindow) == "function" then
+		Airflow = library
+		break
+	end
+end
+
+if not Airflow then
+	error("[RobScript Cambria] Airflow UI could not be loaded")
+end
+
+----- Theme -----
+
+local THEME = {
+	Background = Color3.fromHex("#08090B"),
+	Surface = Color3.fromHex("#12141A"),
+	Surface2 = Color3.fromHex("#181B22"),
+	Surface3 = Color3.fromHex("#262A33"),
+	Stroke = Color3.fromHex("#23272F"),
+	StrokeHover = Color3.fromHex("#3A4050"),
+	Accent = Color3.fromHex("#4FE39B"),
+	AccentDark = Color3.fromHex("#062018"),
+	Text = Color3.fromHex("#F3F6F4"),
+	Muted = Color3.fromHex("#8B93A1"),
+}
+
+Airflow.ThemePresets.Robscript = THEME
+pcall(function()
+	Airflow:SetDefaultTheme("Robscript")
+end)
+
+----- Constants -----
+
+local COLLECT_INTERVAL = 0.5
+local RENDER_INTERVAL = 1 / 30
+local TEXT_INTERVAL = 0.2
+local BOUNDS_INTERVAL = 1
+
+local COLOR_CREATURE = Color3.fromRGB(215, 220, 229)
+local COLOR_DANGER = Color3.fromRGB(255, 78, 106)
+local COLOR_THREAT = Color3.fromRGB(255, 179, 71)
+local COLOR_PREY = Color3.fromRGB(94, 255, 132)
+local COLOR_CRITTER = Color3.fromRGB(255, 227, 138)
+
+local COLOR_MEAT = Color3.fromRGB(255, 138, 91)
+local COLOR_ROTTEN = Color3.fromRGB(150, 106, 87)
+local COLOR_MINERAL = Color3.fromRGB(143, 199, 255)
+local COLOR_PLANT = Color3.fromRGB(140, 230, 140)
+local COLOR_FOSSIL = Color3.fromRGB(255, 215, 94)
+local COLOR_DIG = Color3.fromRGB(201, 166, 255)
+local COLOR_NEST = Color3.fromRGB(255, 169, 212)
+
+local COLOR_PLACE = Color3.fromRGB(167, 224, 255)
+local COLOR_CAVE = Color3.fromRGB(182, 199, 255)
+local COLOR_WARM = Color3.fromRGB(255, 158, 89)
+
+-- Nearest targets kept per category, so the screen stays readable.
+local CAP = {
+	Carcass = 30,
+	Node = 40,
+	Fossil = 20,
+	Dig = 25,
+	Nest = 6,
+	Critter = 12,
+	Place = 60,
+	Cave = 12,
+	Warm = 5,
+}
+
+local TIER_NAMES = { "Hatchling", "Juvenile", "Adolescent", "Adult", "Elder", "Titan" }
+local PLACES = {}
+local CAVES = {}
+
+-- Targets that died this many sync passes in a row are dropped, which keeps
+-- billboards from flickering when a category is capped by distance.
+local DROP_AFTER_MISSES = 3
+
+----- Flags -----
+
+local flagCache = {}
+
+local function resetFlagCache()
+	flagCache = {}
+end
+
+local function getFlag(name)
+	local cached = flagCache[name]
+	if cached ~= nil then
+		return cached ~= false and cached or nil
+	end
+	local container = Airflow.Flags
+	local entry = type(container) == "table" and container[name] or nil
+	if type(entry) == "table" then
+		flagCache[name] = entry
+		return entry
+	end
+	flagCache[name] = false
+	return nil
+end
+
+local function flag(name, fallback)
+	local entry = getFlag(name)
+	if not entry then
+		return fallback
+	end
+	local ok, value = pcall(function()
+		return entry:Get()
+	end)
+	if ok and value ~= nil then
+		return value
+	end
+	return fallback
+end
+
+local function setFlag(name, value)
+	local entry = getFlag(name)
+	if not entry then
+		return false
+	end
+	return (pcall(function()
+		entry:Set(value)
+	end))
+end
+
+----- Helpers -----
+
+local function colorToHex(color)
+	local red = math.floor(math.clamp(color.R, 0, 1) * 255 + 0.5)
+	local green = math.floor(math.clamp(color.G, 0, 1) * 255 + 0.5)
+	local blue = math.floor(math.clamp(color.B, 0, 1) * 255 + 0.5)
+	return string.format("#%02X%02X%02X", red, green, blue)
+end
+
+local function distanceOrigin()
+	if flag("DistanceFrom", "Camera") == "Character" then
+		local character = LocalPlayer.Character
+		if character then
+			local root = character:FindFirstChild("HumanoidRootPart")
+			if root then
+				return root.Position
+			end
+		end
+	end
+	local camera = workspace.CurrentCamera
+	if camera then
+		return camera.CFrame.Position
+	end
+	return Vector3.zero
+end
+
+local function formatDistance(studs)
+	if studs >= 1000 then
+		return string.format("%.1fk", studs / 1000)
+	end
+	return string.format("%dm", math.floor(studs + 0.5))
+end
+
+local function prettyName(rawName)
+	local words = {}
+	for word in string.gmatch(rawName, "[^_]+") do
+		if not tonumber(word) then
+			words[#words + 1] = word:sub(1, 1):upper() .. word:sub(2)
+		end
+	end
+	if #words == 0 then
+		return rawName
+	end
+	return table.concat(words, " ")
+end
+
+local function round(value)
+	return math.floor(value + 0.5)
+end
+
+----- Shared game data -----
+
+local function loadSharedData()
+	local sharedFolder = ReplicatedStorage:FindFirstChild("Shared")
+	if not sharedFolder then
+		return
+	end
+
+	local tiersModule = sharedFolder:FindFirstChild("Tiers")
+	if tiersModule then
+		pcall(function()
+			local tiers = require(tiersModule)
+			for index = 1, #TIER_NAMES do
+				local entry = tiers[index]
+				if type(entry) == "table" and type(entry.name) == "string" then
+					TIER_NAMES[index] = entry.name
+				end
+			end
+		end)
+	end
+
+	local placesModule = sharedFolder:FindFirstChild("Map2Places")
+	if placesModule then
+		pcall(function()
+			local places = require(placesModule)
+			local list = type(places.all) == "function" and places.all() or nil
+			if type(list) == "table" then
+				for _, place in ipairs(list) do
+					if type(place) == "table" and typeof(place.position) == "Vector3" then
+						PLACES[#PLACES + 1] = {
+							name = tostring(place.name or "Place"),
+							biome = tostring(place.biome or ""),
+							kind = tostring(place.kind or ""),
+							importance = tonumber(place.importance) or 1,
+							position = place.position,
+						}
+					end
+				end
+			end
+		end)
+	end
+
+	local cavesModule = sharedFolder:FindFirstChild("Caves")
+	if cavesModule then
+		pcall(function()
+			local caves = require(cavesModule)
+			local list = type(caves.entrances) == "function" and caves.entrances() or nil
+			if type(list) == "table" then
+				for _, entrance in ipairs(list) do
+					local position = entrance.at
+					if typeof(position) == "Vector3" then
+						CAVES[#CAVES + 1] = {
+							kind = tostring(entrance.kind or "cave"),
+							position = position,
+						}
+					end
+				end
+			end
+		end)
+	end
+end
+
+loadSharedData()
+
+----- Creature visuals (the meshes live outside the character model) -----
+
+local function visualFolder(name)
+	local container = workspace:FindFirstChild("CreatureVisuals")
+	if not container then
+		return nil
+	end
+	local folder = container:FindFirstChild(name)
+	if folder and #folder:GetChildren() > 0 then
+		return folder
+	end
+	return nil
+end
+
+local function bestVisualPart(name)
+	local folder = visualFolder(name)
+	if not folder then
+		return nil
+	end
+	local best, bestVolume = nil, -1
+	for _, descendant in ipairs(folder:GetDescendants()) do
+		if descendant:IsA("BasePart") and descendant.Transparency < 0.9 then
+			local size = descendant.Size
+			local volume = size.X * size.Y * size.Z
+			if volume > bestVolume then
+				best, bestVolume = descendant, volume
+			end
+		end
+	end
+	return best
+end
+
+local function visualBounds(name)
+	local folder = visualFolder(name)
+	if not folder then
+		return nil
+	end
+	local minPoint = Vector3.new(math.huge, math.huge, math.huge)
+	local maxPoint = Vector3.new(-math.huge, -math.huge, -math.huge)
+	local found = false
+	for _, descendant in ipairs(folder:GetDescendants()) do
+		if descendant:IsA("BasePart") and descendant.Transparency < 0.9 then
+			local position = descendant.Position
+			local half = descendant.Size * 0.5
+			minPoint = Vector3.new(
+				math.min(minPoint.X, position.X - half.X),
+				math.min(minPoint.Y, position.Y - half.Y),
+				math.min(minPoint.Z, position.Z - half.Z)
+			)
+			maxPoint = Vector3.new(
+				math.max(maxPoint.X, position.X + half.X),
+				math.max(maxPoint.Y, position.Y + half.Y),
+				math.max(maxPoint.Z, position.Z + half.Z)
+			)
+			found = true
+		end
+	end
+	if not found then
+		return nil
+	end
+	return (minPoint + maxPoint) * 0.5, maxPoint - minPoint
+end
+
+----- Drawing -----
+
+local DrawingLib = nil
+if type(Drawing) == "table" and type(Drawing.new) == "function" then
+	DrawingLib = Drawing
+end
+
+local function newLine()
+	if not DrawingLib then
+		return nil
+	end
+	local ok, line = pcall(DrawingLib.new, "Line")
+	if ok and line then
+		line.Visible = false
+		return line
+	end
+	return nil
+end
+
+----- Anchors for points that have no part (places, caves) -----
+
+local anchorsFolder = nil
+
+local function getAnchorsFolder()
+	if anchorsFolder and anchorsFolder.Parent then
+		return anchorsFolder
+	end
+	anchorsFolder = workspace:FindFirstChild("ESP_Anchors")
+	if not anchorsFolder then
+		anchorsFolder = Instance.new("Folder")
+		anchorsFolder.Name = "ESP_Anchors"
+		anchorsFolder.Parent = workspace
+	end
+	return anchorsFolder
+end
+
+local function createAnchor(position)
+	local anchor = Instance.new("Part")
+	anchor.Name = "ESP_Anchor"
+	anchor.Anchored = true
+	anchor.CanCollide = false
+	anchor.CanQuery = false
+	anchor.CanTouch = false
+	anchor.CastShadow = false
+	anchor.Massless = true
+	anchor.Transparency = 1
+	anchor.Size = Vector3.new(0.2, 0.2, 0.2)
+	anchor.CFrame = CFrame.new(position)
+	anchor.Parent = getAnchorsFolder()
+	return anchor
+end
+
+local function clearAnchors()
+	if anchorsFolder then
+		pcall(function()
+			anchorsFolder:Destroy()
+		end)
+		anchorsFolder = nil
+	end
+end
+
+----- Target registry -----
+
+local targets = {}
+local stats = { creatures = 0, resources = 0, places = 0 }
+local running = true
+
+local function releaseVisuals(target)
+	if target.highlight then
+		pcall(function()
+			target.highlight:Destroy()
+		end)
+		target.highlight = nil
+	end
+	if target.billboard then
+		pcall(function()
+			target.billboard:Destroy()
+		end)
+		target.billboard = nil
+		target.label = nil
+	end
+	if target.lines then
+		for _, line in ipairs(target.lines) do
+			pcall(function()
+				line.Visible = false
+				line:Remove()
+			end)
+		end
+		target.lines = nil
+	end
+	if target.tracer then
+		pcall(function()
+			target.tracer.Visible = false
+			target.tracer:Remove()
+		end)
+		target.tracer = nil
+	end
+	target.hasVisual = false
+end
+
+local function dropTarget(key)
+	local target = targets[key]
+	if not target then
+		return
+	end
+	releaseVisuals(target)
+	if target.anchor then
+		pcall(function()
+			target.anchor:Destroy()
+		end)
+		target.anchor = nil
+	end
+	targets[key] = nil
+end
+
+local function clearAllTargets()
+	for key in pairs(targets) do
+		dropTarget(key)
+	end
+	clearAnchors()
+	stats.creatures = 0
+	stats.resources = 0
+	stats.places = 0
+end
+
+----- Billboard and highlight builders -----
+
+local function buildBillboard(part, offsetY)
+	local billboard = Instance.new("BillboardGui")
+	billboard.Name = "ESP_Billboard"
+	billboard.AlwaysOnTop = true
+	billboard.LightInfluence = 0
+	billboard.Size = UDim2.fromOffset(360, 54)
+	billboard.StudsOffset = Vector3.new(0, offsetY, 0)
+	billboard.Enabled = false
+
+	local label = Instance.new("TextLabel")
+	label.Name = "ESP_Label"
+	label.BackgroundTransparency = 1
+	label.Size = UDim2.fromScale(1, 1)
+	label.Font = Enum.Font.GothamBold
+	label.TextSize = 16
+	label.RichText = true
+	label.TextXAlignment = Enum.TextXAlignment.Center
+	label.TextYAlignment = Enum.TextYAlignment.Bottom
+	label.TextStrokeTransparency = 0.25
+	label.TextColor3 = Color3.fromRGB(255, 255, 255)
+	label.Text = ""
+	label.Parent = billboard
+
+	billboard.Adornee = part
+	billboard.Parent = part
+	return billboard, label
+end
+
+local function ensureBillboard(target, part, offsetY)
+	if target.billboard and target.billboard.Parent then
+		target.billboard.Adornee = part
+		target.billboard.StudsOffset = Vector3.new(0, offsetY, 0)
+		return
+	end
+	target.billboard, target.label = buildBillboard(part, offsetY)
+end
+
+local function updateHighlight(target, part, color, enabled)
+	if not enabled or not part then
+		if target.highlight then
+			pcall(function()
+				target.highlight:Destroy()
+			end)
+			target.highlight = nil
+		end
+		return
+	end
+	local highlight = target.highlight
+	if not highlight or not highlight.Parent or highlight.Adornee ~= part then
+		if highlight then
+			pcall(function()
+				highlight:Destroy()
+			end)
+		end
+		highlight = Instance.new("Highlight")
+		highlight.Name = "ESP_Chams"
+		highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+		highlight.FillTransparency = 0.62
+		highlight.OutlineTransparency = 0.05
+		highlight.Adornee = part
+		highlight.Parent = part
+		target.highlight = highlight
+	end
+	highlight.FillColor = color
+	highlight.OutlineColor = color
+end
+
+----- Label texts -----
+
+local function tierText(creature)
+	local tier = creature:GetAttribute("Tier")
+	if type(tier) ~= "number" then
+		return nil
+	end
+	local index = math.clamp(round(tier), 1, #TIER_NAMES)
+	return string.format("%s T%d", TIER_NAMES[index], index)
+end
+
+local function creatureDetails(creature, distance)
+	local details = {}
+	if flag("CreatureTier", true) then
+		local tier = tierText(creature)
+		if tier then
+			details[#details + 1] = tier
+		end
+	end
+	if flag("CreatureDiet", true) then
+		local diet = creature:GetAttribute("Diet")
+		if type(diet) == "string" then
+			details[#details + 1] = diet
+		end
+	end
+	if flag("CreatureSize", true) then
+		local size = creature:GetAttribute("Size")
+		if type(size) == "number" then
+			details[#details + 1] = string.format("%.1fx", size)
+		end
+	end
+	if flag("CreatureHealth", true) then
+		local humanoid = creature:FindFirstChildOfClass("Humanoid")
+		if humanoid then
+			details[#details + 1] = string.format("%d HP", round(humanoid.Health))
+		end
+	end
+	if flag("CreatureGrowth", false) then
+		local growth = creature:GetAttribute("Growth")
+		if type(growth) == "number" then
+			details[#details + 1] = string.format("%d%% grown", math.clamp(round(growth * 100), 0, 100))
+		end
+	end
+	if flag("CreatureState", true) then
+		local inCombatUntil = creature:GetAttribute("InCombatUntil")
+		if type(inCombatUntil) == "number" and inCombatUntil > workspace:GetServerTimeNow() then
+			details[#details + 1] = "IN FIGHT"
+		end
+		if creature:GetAttribute("Molting") == true then
+			details[#details + 1] = "MOLTING"
+		end
+	end
+	if flag("CreatureDistance", true) then
+		details[#details + 1] = formatDistance(distance)
+	end
+	return details
+end
+
+local function creatureLabel(target, distance)
+	local creature = target.creature
+	if not creature or not creature.Parent then
+		return ""
+	end
+	local title = target.player and target.player.Name or creature.Name
+	if not flag("CreatureName", true) then
+		local speciesOnly = (target.player and target.player:GetAttribute("CreatureName"))
+			or creature:GetAttribute("CreatureName")
+		title = (type(speciesOnly) == "string" and speciesOnly ~= "") and speciesOnly or "Creature"
+	end
+	local speciesText = ""
+	if flag("CreatureSpecies", true) then
+		local species = (target.player and target.player:GetAttribute("CreatureName"))
+			or creature:GetAttribute("CreatureName")
+		if type(species) == "string" and species ~= "" then
+			speciesText = string.format("  <font color=\"#8B93A1\">%s</font>", species)
+		end
+	end
+	local details = creatureDetails(creature, distance)
+	local text = string.format("<font color=\"#FFFFFF\">%s</font>%s", title, speciesText)
+	if #details > 0 then
+		text = text .. string.format("\n<font color=\"#A6AEBE\">%s</font>", table.concat(details, "  |  "))
+	end
+	return text
+end
+
+local function critterLabel(target, distance)
+	local critter = target.creature
+	if not critter or not critter.Parent then
+		return ""
+	end
+	local name = prettyName(critter.Name)
+	if critter:GetAttribute("FightsBack") == true then
+		name = name .. " (fights back)"
+	end
+	local details = {}
+	if flag("CritterHealth", true) then
+		local humanoid = critter:FindFirstChildOfClass("Humanoid")
+		if humanoid then
+			details[#details + 1] = string.format("%d HP", round(humanoid.Health))
+		end
+	end
+	if flag("CritterSize", true) then
+		local size = critter:GetAttribute("Size")
+		if type(size) == "number" then
+			details[#details + 1] = string.format("%.1fx", size)
+		end
+	end
+	if flag("CritterDistance", true) then
+		details[#details + 1] = formatDistance(distance)
+	end
+	local text = string.format("<font color=\"#FFFFFF\">%s</font>", name)
+	if #details > 0 then
+		text = text .. string.format("\n<font color=\"#A6AEBE\">%s</font>", table.concat(details, "  |  "))
+	end
+	return text
+end
+
+local function carcassLabel(target, distance)
+	local model = target.instance
+	if not model or not model.Parent then
+		return ""
+	end
+	local rotten = model:GetAttribute("Rotten") == true
+	local title = string.format("%s%s", prettyName(model.Name), rotten and "  <font color=\"#FF8A8A\">ROTTEN</font>" or "")
+	local details = {}
+	if flag("CarcassUnits", true) then
+		local units = model:GetAttribute("FoodUnits")
+		if type(units) == "number" then
+			details[#details + 1] = string.format("%.1f units", units)
+		end
+	end
+	if flag("CarcassDistance", true) then
+		details[#details + 1] = formatDistance(distance)
+	end
+	local text = string.format("<font color=\"#FFFFFF\">%s</font>", title)
+	if #details > 0 then
+		text = text .. string.format("\n<font color=\"#A6AEBE\">%s</font>", table.concat(details, "  |  "))
+	end
+	return text
+end
+
+local function nodeLabel(target, distance)
+	local model = target.instance
+	if not model or not model.Parent then
+		return ""
+	end
+	local kind = model:GetAttribute("FoodKind")
+	local title = prettyName(model.Name)
+	local details = {}
+	if flag("NodeKind", true) and type(kind) == "string" then
+		details[#details + 1] = kind
+	end
+	if flag("NodeUnits", true) then
+		local units = model:GetAttribute("FoodUnits")
+		if type(units) == "number" then
+			details[#details + 1] = string.format("%.1f units", units)
+		end
+	end
+	if flag("NodeDistance", true) then
+		details[#details + 1] = formatDistance(distance)
+	end
+	local text = string.format("<font color=\"#FFFFFF\">%s</font>", title)
+	if #details > 0 then
+		text = text .. string.format("\n<font color=\"#A6AEBE\">%s</font>", table.concat(details, "  |  "))
+	end
+	return text
+end
+
+local function fossilLabel(target, distance)
+	local model = target.instance
+	if not model or not model.Parent then
+		return ""
+	end
+	local rarity = tostring(model:GetAttribute("Rarity") or "?"):upper()
+	local details = {}
+	if flag("FossilRarity", true) then
+		details[#details + 1] = rarity
+	end
+	if flag("FossilDistance", true) then
+		details[#details + 1] = formatDistance(distance)
+	end
+	local text = "<font color=\"#FFFFFF\">Fossil</font>"
+	if #details > 0 then
+		text = text .. string.format("\n<font color=\"#A6AEBE\">%s</font>", table.concat(details, "  |  "))
+	end
+	return text
+end
+
+local function digLabel(target, distance)
+	local model = target.instance
+	if not model or not model.Parent then
+		return ""
+	end
+	local details = {}
+	if flag("DigDistance", true) then
+		details[#details + 1] = formatDistance(distance)
+	end
+	local text = "<font color=\"#FFFFFF\">Bone bed</font>"
+	if #details > 0 then
+		text = text .. string.format("\n<font color=\"#A6AEBE\">%s</font>", table.concat(details, "  |  "))
+	end
+	return text
+end
+
+local function nestLabel(target, distance)
+	local model = target.instance
+	if not model or not model.Parent then
+		return ""
+	end
+	local details = {}
+	if flag("NestOwner", true) then
+		local owner = model:GetAttribute("OwnerName")
+		if type(owner) == "string" then
+			details[#details + 1] = owner
+		end
+	end
+	if flag("NestEggs", true) then
+		local eggs = model:GetAttribute("Eggs")
+		if type(eggs) == "number" then
+			details[#details + 1] = string.format("%d eggs", round(eggs))
+		end
+	end
+	if flag("NestZone", true) then
+		local zone = model:GetAttribute("Zone")
+		if type(zone) == "string" then
+			details[#details + 1] = zone
+		end
+	end
+	if flag("NestDistance", true) then
+		details[#details + 1] = formatDistance(distance)
+	end
+	local text = "<font color=\"#FFFFFF\">Nest</font>"
+	if #details > 0 then
+		text = text .. string.format("\n<font color=\"#A6AEBE\">%s</font>", table.concat(details, "  |  "))
+	end
+	return text
+end
+
+local function placeLabel(target, distance)
+	local place = target.place
+	local details = {}
+	if flag("PlaceBiome", true) and place.biome ~= "" then
+		details[#details + 1] = place.biome
+	end
+	if flag("PlaceKind", true) and place.kind ~= "" then
+		details[#details + 1] = place.kind
+	end
+	if flag("PlaceDistance", true) then
+		details[#details + 1] = formatDistance(distance)
+	end
+	local text = string.format("<font color=\"#FFFFFF\">%s</font>", place.name)
+	if #details > 0 then
+		text = text .. string.format("\n<font color=\"#A6AEBE\">%s</font>", table.concat(details, "  |  "))
+	end
+	return text
+end
+
+local function caveLabel(target, distance)
+	local cave = target.cave
+	local details = {}
+	if flag("CaveKind", true) then
+		details[#details + 1] = cave.kind
+	end
+	if flag("CaveDistance", true) then
+		details[#details + 1] = formatDistance(distance)
+	end
+	local text = "<font color=\"#FFFFFF\">Cave entrance</font>"
+	if #details > 0 then
+		text = text .. string.format("\n<font color=\"#A6AEBE\">%s</font>", table.concat(details, "  |  "))
+	end
+	return text
+end
+
+local function warmLabel(target, distance)
+	local details = {}
+	if flag("WarmDistance", true) then
+		details[#details + 1] = formatDistance(distance)
+	end
+	local text = "<font color=\"#FFFFFF\">Warm zone</font>"
+	if #details > 0 then
+		text = text .. string.format("\n<font color=\"#A6AEBE\">%s</font>", table.concat(details, "  |  "))
+	end
+	return text
+end
+
+----- Creature colors -----
+
+local function ownSize()
+	local character = LocalPlayer.Character
+	return character and character:GetAttribute("Size") or nil
+end
+
+local function creatureColor(creature)
+	if not flag("ThreatColors", true) then
+		return flag("CreatureColor", COLOR_CREATURE)
+	end
+	local size = creature:GetAttribute("Size")
+	local mine = ownSize()
+	if type(size) ~= "number" or type(mine) ~= "number" or mine <= 0 then
+		return flag("CreatureColor", COLOR_CREATURE)
+	end
+	local ratio = size / mine
+	if ratio >= 1.35 then
+		return flag("DangerColor", COLOR_DANGER)
+	elseif ratio >= 1.1 then
+		return flag("ThreatColor", COLOR_THREAT)
+	elseif ratio <= 0.75 then
+		return flag("PreyColor", COLOR_PREY)
+	end
+	return flag("CreatureColor", COLOR_CREATURE)
+end
+
+local function nodeColor(model)
+	local kind = model:GetAttribute("FoodKind")
+	if kind == "Mineral" then
+		return flag("MineralColor", COLOR_MINERAL)
+	end
+	if kind == "Plant" then
+		return flag("PlantColor", COLOR_PLANT)
+	end
+	return flag("MineralColor", COLOR_MINERAL)
+end
+
+----- Collection -----
+
+local function ensureTarget(key, spec)
+	local target = targets[key]
+	if target then
+		target.spec = spec
+		target.misses = 0
+		return target
+	end
+	target = {
+		key = key,
+		spec = spec,
+		misses = 0,
+		lastTextAt = 0,
+		text = "",
+		hasVisual = false,
+	}
+	targets[key] = target
+	return target
+end
+
+local function resolvePart(target)
+	local spec = target.spec
+	if not spec then
+		return nil
+	end
+	local part = spec.getPart and spec.getPart() or nil
+	target.part = part
+	return part
+end
+
+local function creatureOffsetY(creature)
+	local size = creature:GetAttribute("Size")
+	if type(size) == "number" then
+		return 1.6 + size * 1.9
+	end
+	return 4
+end
+
+-- Early distance filter: collectors skip far objects, so the registry only
+-- holds what can actually be on screen.
+local collectOrigin = nil
+local collectLimit = 1800
+
+local function inCollectRange(position)
+	if not position then
+		return false
+	end
+	if not collectOrigin then
+		return true
+	end
+	return (position - collectOrigin).Magnitude <= collectLimit
+end
+
+-- Food props are only worth drawing close by; a shorter range keeps the
+-- registry small on a map that is covered in plants and ore.
+local NODE_RANGE = 700
+
+local function inNodeRange(position)
+	if not position then
+		return false
+	end
+	if not collectOrigin then
+		return true
+	end
+	return (position - collectOrigin).Magnitude <= math.min(collectLimit, NODE_RANGE)
+end
+
+local function collectCreatures(seen)
+	if not flag("CreatureESP", true) then
+		return
+	end
+	local ignoreSmaller = flag("HideSmaller", false)
+	local mine = ownSize()
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player ~= LocalPlayer then
+			local creature = player.Character
+			if creature and creature.Parent then
+				local root = creature:FindFirstChild("HumanoidRootPart")
+				if root then
+					local size = creature:GetAttribute("Size")
+					local show = true
+					if ignoreSmaller and type(size) == "number" and type(mine) == "number" and size < mine * 0.9 then
+						show = false
+					end
+					if show then
+						local target = ensureTarget(creature, {
+							cat = "Creature",
+							getPart = function()
+								return creature:FindFirstChild("HumanoidRootPart")
+							end,
+							getChamPart = function()
+								return bestVisualPart(player.Name)
+							end,
+							getOffsetY = function()
+								return creatureOffsetY(creature)
+							end,
+							getPos = function()
+								local current = creature:FindFirstChild("HumanoidRootPart")
+								return current and current.Position or nil
+							end,
+							getColor = function()
+								return creatureColor(creature)
+							end,
+							getText = creatureLabel,
+							getBounds = function()
+								return visualBounds(player.Name)
+							end,
+							tracer = true,
+						})
+						target.player = player
+						target.creature = creature
+						seen[target] = true
+					end
+				end
+			end
+		end
+	end
+end
+
+local function collectCritters(seen)
+	if not flag("CritterESP", false) then
+		return
+	end
+	local container = workspace:FindFirstChild("Creatures")
+	local critters = container and container:FindFirstChild("Critters")
+	if not critters then
+		return
+	end
+	for _, critter in ipairs(critters:GetChildren()) do
+		if critter:IsA("Model") and critter:FindFirstChild("HumanoidRootPart") then
+			local target = ensureTarget(critter, {
+				cat = "Critter",
+				getPart = function()
+					return critter:FindFirstChild("HumanoidRootPart")
+				end,
+				getChamPart = function()
+					return bestVisualPart("Critter")
+				end,
+				getOffsetY = function()
+					local size = critter:GetAttribute("Size")
+					return type(size) == "number" and (1.4 + size * 1.6) or 3
+				end,
+				getPos = function()
+					local root = critter:FindFirstChild("HumanoidRootPart")
+					return root and root.Position or nil
+				end,
+				getColor = function()
+					return flag("CritterColor", COLOR_CRITTER)
+				end,
+				getText = critterLabel,
+				getBounds = function()
+					return visualBounds("Critter")
+				end,
+			})
+			target.creature = critter
+			seen[target] = true
+		end
+	end
+end
+
+local function firstPart(model)
+	if model.PrimaryPart then
+		return model.PrimaryPart
+	end
+	for _, child in ipairs(model:GetChildren()) do
+		if child:IsA("BasePart") then
+			return child
+		end
+	end
+	local ok, descendant = pcall(function()
+		return model:FindFirstChildWhichIsA("BasePart", true)
+	end)
+	if ok then
+		return descendant
+	end
+	return nil
+end
+
+-- Position of anything that holds food data: a part when it has one, the
+-- pivot when the meshes are managed by the client (meat carcasses).
+local function modelPosition(model)
+	local part = firstPart(model)
+	if part then
+		return part.Position
+	end
+	local ok, pivot = pcall(function()
+		return model:GetPivot().Position
+	end)
+	if ok then
+		return pivot
+	end
+	return nil
+end
+
+local function collectCarcasses(seen)
+	if not flag("CarcassESP", true) then
+		return
+	end
+	local hideRotten = flag("HideRotten", true)
+	local container = workspace:FindFirstChild("Carcasses")
+	if not container then
+		return
+	end
+	for _, model in ipairs(container:GetChildren()) do
+		if model:IsA("Model") and model:GetAttribute("FoodKind") == "Meat" then
+			local rotten = model:GetAttribute("Rotten") == true
+			if not (hideRotten and rotten) and inCollectRange(modelPosition(model)) then
+				local target = ensureTarget(model, {
+					cat = "Carcass",
+					getPos = function()
+						local ok, pivot = pcall(function()
+							return model:GetPivot().Position
+						end)
+						return ok and pivot or nil
+					end,
+					getChamPart = function()
+						return firstPart(model)
+					end,
+					getOffsetY = function()
+						return 3
+					end,
+					getColor = function()
+						return rotten and flag("RottenColor", COLOR_ROTTEN) or flag("MeatColor", COLOR_MEAT)
+					end,
+					getText = carcassLabel,
+				})
+				target.instance = model
+				seen[target] = true
+			end
+		end
+	end
+end
+
+local function collectNodes(seen)
+	if not flag("NodeESP", false) then
+		return
+	end
+	local showMineral = flag("NodeMineral", true)
+	local showPlant = flag("NodePlant", true)
+	local minUnits = flag("NodeMinUnits", 0)
+	local props = workspace:FindFirstChild("World")
+	props = props and props:FindFirstChild("Props")
+	if not props then
+		return
+	end
+	for _, chunk in ipairs(props:GetChildren()) do
+		for _, model in ipairs(chunk:GetChildren()) do
+			if model:IsA("Model") then
+				local kind = model:GetAttribute("FoodKind")
+				if kind == "Mineral" or kind == "Plant" then
+					local units = model:GetAttribute("FoodUnits")
+					local allowed = (kind == "Mineral" and showMineral) or (kind == "Plant" and showPlant)
+					if allowed and type(units) == "number" and units >= minUnits and inNodeRange(modelPosition(model)) then
+						local target = ensureTarget(model, {
+							cat = "Node",
+							getPart = function()
+								return firstPart(model)
+							end,
+							getChamPart = function()
+								return firstPart(model)
+							end,
+							getPos = function()
+								local part = firstPart(model)
+								return part and part.Position or nil
+							end,
+							getOffsetY = function()
+								return 2.4
+							end,
+							getColor = function()
+								return nodeColor(model)
+							end,
+							getText = nodeLabel,
+						})
+						target.instance = model
+						seen[target] = true
+					end
+				end
+			end
+		end
+	end
+end
+
+local function collectFossils(seen)
+	if not flag("FossilESP", true) then
+		return
+	end
+	local showCommon = flag("FossilCommon", true)
+	local showRare = flag("FossilRare", true)
+	local showLegendary = flag("FossilLegendary", true)
+	local container = workspace:FindFirstChild("Fossils")
+	if not container then
+		return
+	end
+	for _, model in ipairs(container:GetChildren()) do
+		if model:IsA("Model") then
+			local rarity = model:GetAttribute("Rarity")
+			local allowed = (rarity == "common" and showCommon)
+				or (rarity == "rare" and showRare)
+				or (rarity == "legendary" and showLegendary)
+			if allowed and inCollectRange(modelPosition(model)) then
+				local target = ensureTarget(model, {
+					cat = "Fossil",
+					getPart = function()
+						return firstPart(model)
+					end,
+					getChamPart = function()
+						return firstPart(model)
+					end,
+					getPos = function()
+						local part = firstPart(model)
+						if part then
+							return part.Position
+						end
+						local ok, pivot = pcall(function()
+							return model:GetPivot().Position
+						end)
+						return ok and pivot or nil
+					end,
+					getOffsetY = function()
+						return 3
+					end,
+					getColor = function()
+						return flag("FossilColor", COLOR_FOSSIL)
+					end,
+					getText = fossilLabel,
+				})
+				target.instance = model
+				seen[target] = true
+			end
+		end
+	end
+end
+
+local function collectDigSites(seen)
+	if not flag("DigESP", false) then
+		return
+	end
+	local container = workspace:FindFirstChild("CaveBones")
+	if not container then
+		return
+	end
+	for _, model in ipairs(container:GetChildren()) do
+		if model:IsA("Model") and model:FindFirstChild("Glint", true) and inCollectRange(modelPosition(model)) then
+			local target = ensureTarget(model, {
+				cat = "Dig",
+				getPart = function()
+					return firstPart(model)
+				end,
+				getChamPart = function()
+					return model:FindFirstChild("Glint", true) or firstPart(model)
+				end,
+				getPos = function()
+					local part = firstPart(model)
+					return part and part.Position or nil
+				end,
+				getOffsetY = function()
+					return 2.6
+				end,
+				getColor = function()
+					return flag("DigColor", COLOR_DIG)
+				end,
+				getText = digLabel,
+			})
+			target.instance = model
+			seen[target] = true
+		end
+	end
+end
+
+local function collectNests(seen)
+	if not flag("NestESP", false) then
+		return
+	end
+	local container = workspace:FindFirstChild("Nests")
+	if not container then
+		return
+	end
+	for _, model in ipairs(container:GetChildren()) do
+		if model:IsA("Model") and inCollectRange(modelPosition(model)) then
+			local target = ensureTarget(model, {
+				cat = "Nest",
+				getPart = function()
+					return firstPart(model)
+				end,
+				getChamPart = function()
+					return firstPart(model)
+				end,
+				getPos = function()
+					local part = firstPart(model)
+					return part and part.Position or nil
+				end,
+				getOffsetY = function()
+					return 2.6
+				end,
+				getColor = function()
+					return flag("NestColor", COLOR_NEST)
+				end,
+				getText = nestLabel,
+			})
+			target.instance = model
+			seen[target] = true
+		end
+	end
+end
+
+local function collectPlaces(seen)
+	if not flag("PlaceESP", true) then
+		return
+	end
+	local onlyMajor = flag("PlaceOnlyMajor", false)
+	for index, place in ipairs(PLACES) do
+		if not (onlyMajor and place.importance < 2) and inCollectRange(place.position) then
+			local key = "place:" .. index
+			local target = ensureTarget(key, {
+				cat = "Place",
+				getPos = function()
+					return place.position
+				end,
+				getOffsetY = function()
+					return 6
+				end,
+				getColor = function()
+					return flag("PlaceColor", COLOR_PLACE)
+				end,
+				getText = placeLabel,
+			})
+			target.place = place
+			seen[target] = true
+		end
+	end
+end
+
+local function collectCaves(seen)
+	if not flag("CaveESP", true) then
+		return
+	end
+	for index, cave in ipairs(CAVES) do
+		if inCollectRange(cave.position) then
+			local key = "cave:" .. index
+			local target = ensureTarget(key, {
+				cat = "Cave",
+				getPos = function()
+					return cave.position
+				end,
+				getOffsetY = function()
+					return 6
+				end,
+				getColor = function()
+					return flag("CaveColor", COLOR_CAVE)
+				end,
+				getText = caveLabel,
+			})
+			target.cave = cave
+			seen[target] = true
+		end
+	end
+end
+
+local function collectWarmZones(seen)
+	if not flag("WarmESP", false) then
+		return
+	end
+	local container = workspace:FindFirstChild("HotSpots")
+	if not container then
+		return
+	end
+	for _, part in ipairs(container:GetChildren()) do
+		if part:IsA("BasePart") and inCollectRange(part.Position) then
+			local target = ensureTarget(part, {
+				cat = "Warm",
+				getPart = function()
+					return part
+				end,
+				getChamPart = function()
+					return part
+				end,
+				getPos = function()
+					return part.Position
+				end,
+				getOffsetY = function()
+					return 3
+				end,
+				getColor = function()
+					return flag("WarmColor", COLOR_WARM)
+				end,
+				getText = warmLabel,
+			})
+			target.instance = part
+			seen[target] = true
+		end
+	end
+end
+
+----- Collection pass with distance caps -----
+
+local function collectTargets()
+	local seen = {}
+	-- Range is resolved before the collectors run, so they can skip far objects.
+	local origin = distanceOrigin()
+	collectOrigin = origin
+	collectLimit = flag("RenderDistance", 1400) + 200
+	pcall(collectCreatures, seen)
+	pcall(collectCritters, seen)
+	pcall(collectCarcasses, seen)
+	pcall(collectNodes, seen)
+	pcall(collectFossils, seen)
+	pcall(collectDigSites, seen)
+	pcall(collectNests, seen)
+	pcall(collectPlaces, seen)
+	pcall(collectCaves, seen)
+	pcall(collectWarmZones, seen)
+
+	local limit = collectLimit
+
+	-- Distance caps per category: only the nearest targets stay drawn.
+	local byCategory = {}
+	for target in pairs(seen) do
+		local spec = target.spec
+		if spec then
+			local position = target.spec.getPos and target.spec.getPos() or nil
+			if position then
+				local distance = (position - origin).Magnitude
+				if distance <= limit then
+					target.distance = distance
+					target.color = spec.getColor and spec.getColor() or nil
+					local bucket = byCategory[spec.cat]
+					if not bucket then
+						bucket = {}
+						byCategory[spec.cat] = bucket
+					end
+					bucket[#bucket + 1] = target
+				else
+					seen[target] = nil
+				end
+			else
+				seen[target] = nil
+			end
+		end
+	end
+
+	for target in pairs(seen) do
+		target.capped = false
+	end
+	for category, bucket in pairs(byCategory) do
+		local cap = CAP[category]
+		if cap and #bucket > cap then
+			table.sort(bucket, function(left, right)
+				return left.distance < right.distance
+			end)
+			-- Over-cap targets stay registered but hidden, so they do not
+			-- churn billboards every sync pass.
+			for index = cap + 1, #bucket do
+				bucket[index].capped = true
+			end
+		end
+	end
+
+	for _, target in pairs(targets) do
+		target.seenNow = false
+	end
+	for target in pairs(seen) do
+		target.misses = 0
+		target.seenNow = true
+	end
+	for key, target in pairs(targets) do
+		if not seen[target] then
+			target.misses = target.misses + 1
+			if target.misses >= DROP_AFTER_MISSES then
+				dropTarget(key)
+			end
+		end
+	end
+
+	stats.creatures = 0
+	stats.resources = 0
+	stats.places = 0
+	for key, target in pairs(targets) do
+		local category = target.spec and target.spec.cat or ""
+		if not target.seenNow or target.capped then
+			-- out of range or hidden by the distance cap: not drawn, not counted
+		elseif category == "Creature" or category == "Critter" then
+			stats.creatures = stats.creatures + 1
+		elseif category == "Place" or category == "Cave" or category == "Warm" then
+			stats.places = stats.places + 1
+		else
+			stats.resources = stats.resources + 1
+		end
+	end
+end
+
+----- Rendering -----
+
+local function projectBox(center, size)
+	local camera = workspace.CurrentCamera
+	if not camera then
+		return nil
+	end
+	local half = size * 0.5
+	local minX, minY = math.huge, math.huge
+	local maxX, maxY = -math.huge, -math.huge
+	local depthHits = 0
+	for x = -1, 1, 2 do
+		for y = -1, 1, 2 do
+			for z = -1, 1, 2 do
+				local world = center + Vector3.new(half.X * x, half.Y * y, half.Z * z)
+				local screen = camera:WorldToViewportPoint(world)
+				if screen.Z > 0 then
+					depthHits = depthHits + 1
+					minX = math.min(minX, screen.X)
+					minY = math.min(minY, screen.Y)
+					maxX = math.max(maxX, screen.X)
+					maxY = math.max(maxY, screen.Y)
+				end
+			end
+		end
+	end
+	if depthHits < 2 then
+		return nil
+	end
+	return minX, minY, maxX, maxY
+end
+
+local function hideBox(target)
+	if target.lines then
+		for _, line in ipairs(target.lines) do
+			if line.Visible then
+				line.Visible = false
+			end
+		end
+	end
+end
+
+local function updateBox(target, color, center, size)
+	if not center or not size then
+		hideBox(target)
+		return
+	end
+	local minX, minY, maxX, maxY = projectBox(center, size)
+	if not minX then
+		hideBox(target)
+		return
+	end
+	if not target.lines then
+		target.lines = { newLine(), newLine(), newLine(), newLine() }
+	end
+	local lines = target.lines
+	if not lines[1] then
+		return
+	end
+	local segments = {
+		{ Vector2.new(minX, minY), Vector2.new(maxX, minY) },
+		{ Vector2.new(maxX, minY), Vector2.new(maxX, maxY) },
+		{ Vector2.new(maxX, maxY), Vector2.new(minX, maxY) },
+		{ Vector2.new(minX, maxY), Vector2.new(minX, minY) },
+	}
+	for index = 1, 4 do
+		local line = lines[index]
+		if line then
+			local segment = segments[index]
+			line.From = segment[1]
+			line.To = segment[2]
+			line.Color = color
+			line.Thickness = 1
+			line.Visible = true
+		end
+	end
+end
+
+local function updateTracer(target, color, position, enabled)
+	if not enabled then
+		if target.tracer and target.tracer.Visible then
+			target.tracer.Visible = false
+		end
+		return
+	end
+	local camera = workspace.CurrentCamera
+	if not camera then
+		return
+	end
+	local viewport = camera.ViewportSize
+	local screen = camera:WorldToViewportPoint(position)
+	if screen.Z <= 0 then
+		if target.tracer then
+			target.tracer.Visible = false
+		end
+		return
+	end
+	if not target.tracer then
+		target.tracer = newLine()
+	end
+	if not target.tracer then
+		return
+	end
+	local tracer = target.tracer
+	tracer.From = Vector2.new(viewport.X * 0.5, viewport.Y)
+	tracer.To = Vector2.new(screen.X, screen.Y)
+	tracer.Color = color
+	tracer.Thickness = 1
+	tracer.Visible = true
+end
+
+local function hideTargetVisuals(target)
+	if target.billboard and target.billboard.Enabled then
+		target.billboard.Enabled = false
+	end
+	hideBox(target)
+	if target.tracer and target.tracer.Visible then
+		target.tracer.Visible = false
+	end
+	if target.highlight then
+		pcall(function()
+			target.highlight:Destroy()
+		end)
+		target.highlight = nil
+	end
+	target.hasVisual = false
+end
+
+local function updateTarget(target, origin, settings)
+	local spec = target.spec
+	if not spec then
+		hideTargetVisuals(target)
+		return
+	end
+
+	-- Over-cap targets are skipped before any instance or distance work.
+	if target.capped then
+		hideTargetVisuals(target)
+		return
+	end
+
+	local part = target.part
+	if not part or not part.Parent then
+		part = spec.getPart and spec.getPart() or nil
+	end
+	local position = part and part.Position or (spec.getPos and spec.getPos() or nil)
+
+	-- Things like meat have no meshes on the client, only a pivot, so they get
+	-- a tiny invisible anchor part for the label to hang on.
+	if not part and position then
+		local anchor = target.anchor
+		if not anchor or not anchor.Parent then
+			anchor = createAnchor(position)
+			target.anchor = anchor
+		elseif (anchor.Position - position).Magnitude > 0.5 then
+			anchor.CFrame = CFrame.new(position)
+		end
+		part = anchor
+	end
+	target.part = part
+
+	if not position then
+		hideTargetVisuals(target)
+		return
+	end
+
+	local distance = (position - origin).Magnitude
+	local color = target.color or (spec.getColor and spec.getColor()) or COLOR_CREATURE
+
+	if target.capped then
+		hideTargetVisuals(target)
+		return
+	end
+
+	if part then
+		local offsetY = spec.getOffsetY and spec.getOffsetY() or 3
+		ensureBillboard(target, part, offsetY)
+		target.billboard.MaxDistance = settings.renderDistance
+		target.billboard.Enabled = true
+		local now = os.clock()
+		if now - target.lastTextAt >= TEXT_INTERVAL then
+			target.lastTextAt = now
+			local text = spec.getText and spec.getText(target, distance) or ""
+			-- The first span is the title, so it takes the category color.
+			text = string.gsub(text, '<font color="#FFFFFF">', '<font color="' .. colorToHex(color) .. '">', 1)
+			if text ~= target.text then
+				target.text = text
+				target.label.Text = text
+			end
+		end
+		target.label.TextColor3 = color
+	end
+
+	if distance > settings.renderDistance then
+		hideTargetVisuals(target)
+		return
+	end
+
+	local category = spec.cat
+
+	if settings.box[category] then
+		local now = os.clock()
+		local center, size = target.boundsCenter, target.boundsSize
+		if not center or now - (target.boundsAt or 0) >= BOUNDS_INTERVAL then
+			target.boundsAt = now
+			center, size = nil, nil
+			if spec.getBounds then
+				center, size = spec.getBounds()
+			end
+			target.boundsCenter, target.boundsSize = center, size
+		end
+		if center and size then
+			updateBox(target, color, center, size)
+		else
+			hideBox(target)
+		end
+	else
+		hideBox(target)
+	end
+
+	local chamsPart = nil
+	if settings.chams[category] and target.allowChams and distance <= settings.chamsDistance then
+		local now = os.clock()
+		local cached = target.chamPart
+		if not cached or not cached.Parent or now - (target.chamAt or 0) >= 1 then
+			cached = spec.getChamPart and spec.getChamPart() or nil
+			target.chamPart = cached
+			target.chamAt = now
+		end
+		chamsPart = cached
+	end
+	updateHighlight(target, chamsPart, color, chamsPart ~= nil)
+
+	updateTracer(target, color, position, spec.tracer == true and settings.tracer)
+	target.hasVisual = true
+end
+
+----- Chams budget -----
+
+local function refreshChamsBudget(chamsDistance, maxCount)
+	local candidates = {}
+	for _, target in pairs(targets) do
+		target.allowChams = false
+		if target.hasVisual and target.spec and target.distance and target.distance <= chamsDistance and not target.capped then
+			candidates[#candidates + 1] = target
+		end
+	end
+	table.sort(candidates, function(left, right)
+		return (left.distance or 0) < (right.distance or 0)
+	end)
+	for index = 1, math.min(#candidates, maxCount) do
+		candidates[index].allowChams = true
+	end
+end
+
+-- Flags are read once per rendered frame instead of once per target.
+local function readSettings()
+	return {
+		renderDistance = flag("RenderDistance", 1400),
+		chamsDistance = flag("ChamsDistance", 450),
+		tracer = flag("CreatureTracer", false),
+		chams = {
+			Creature = flag("CreatureChams", true),
+			Critter = flag("CritterChams", true),
+			Carcass = flag("CarcassChams", false),
+			Node = flag("NodeChams", false),
+			Fossil = flag("FossilChams", true),
+			Dig = flag("DigChams", false),
+			Nest = flag("NestChams", true),
+			Warm = flag("WarmChams", false),
+		},
+		box = {
+			Creature = flag("CreatureBox", false),
+			Critter = flag("CritterBox", false),
+		},
+	}
+end
+
+----- Interface -----
+
+local Window = Airflow:CreateWindow({
+	Name = "Robscript Team",
+	LoadingSubtitle = "cambria - creature esp",
+	ToggleUIKeybind = "RightControl",
+	Size = UDim2.fromOffset(800, 560),
+	Theme = THEME,
+	Density = "Compact",
+	Backdrop = { Weather = "Fireflies", Tint = 0.35 },
+	ConfigurationSaving = { Enabled = true, FolderName = "RobScriptCambria" },
+	Home = {
+		Title = "Robscript Team",
+		Welcome = "Welcome back,",
+		Tier = "ESP 1.0",
+		Stats = { "Players", "Session", "FPS", "Ping", "Game", "Executor" },
+	},
+})
+
+-- An unknown icon name must never kill the script, so tabs fall back to plain.
+local function createTab(name, icon)
+	local ok, tab = pcall(function()
+		return Window:CreateTab({ Name = name, Icon = icon })
+	end)
+	if ok and tab then
+		return tab
+	end
+	return Window:CreateTab({ Name = name })
+end
+
+----- Creatures tab -----
+
+local CreaturesTab = createTab("Creatures", "eye")
+local PlayerBox = CreaturesTab:CreateGroupbox({ Name = "Creatures", Side = "Left" })
+local CritterBox = CreaturesTab:CreateGroupbox({ Name = "Critters", Side = "Right" })
+
+PlayerBox:CreateToggle({
+	Name = "Creature ESP",
+	Desc = "Track every player creature around you",
+	Flag = "CreatureESP",
+	CurrentValue = true,
+})
+PlayerBox:CreateToggle({ Name = "Name", Flag = "CreatureName", CurrentValue = true, DependsOn = "CreatureESP" })
+PlayerBox:CreateToggle({ Name = "Species", Flag = "CreatureSpecies", CurrentValue = true, DependsOn = "CreatureESP" })
+PlayerBox:CreateToggle({ Name = "Stage", Flag = "CreatureTier", CurrentValue = true, DependsOn = "CreatureESP" })
+PlayerBox:CreateToggle({ Name = "Diet", Flag = "CreatureDiet", CurrentValue = true, DependsOn = "CreatureESP" })
+PlayerBox:CreateToggle({ Name = "Size", Flag = "CreatureSize", CurrentValue = true, DependsOn = "CreatureESP" })
+PlayerBox:CreateToggle({ Name = "Health", Flag = "CreatureHealth", CurrentValue = true, DependsOn = "CreatureESP" })
+PlayerBox:CreateToggle({ Name = "Growth", Flag = "CreatureGrowth", CurrentValue = false, DependsOn = "CreatureESP" })
+PlayerBox:CreateToggle({
+	Name = "State",
+	Desc = "Show fights and molting",
+	Flag = "CreatureState",
+	CurrentValue = true,
+	DependsOn = "CreatureESP",
+})
+PlayerBox:CreateToggle({ Name = "Distance", Flag = "CreatureDistance", CurrentValue = true, DependsOn = "CreatureESP" })
+PlayerBox:CreateDivider()
+PlayerBox:CreateToggle({
+	Name = "Chams",
+	Desc = "Glow the biggest body mesh",
+	Flag = "CreatureChams",
+	CurrentValue = true,
+	DependsOn = "CreatureESP",
+})
+PlayerBox:CreateToggle({ Name = "Box", Flag = "CreatureBox", CurrentValue = false, DependsOn = "CreatureESP" })
+PlayerBox:CreateToggle({ Name = "Tracer", Flag = "CreatureTracer", CurrentValue = false, DependsOn = "CreatureESP" })
+PlayerBox:CreateToggle({
+	Name = "Color by size",
+	Desc = "Red is bigger than you, green is smaller",
+	Flag = "ThreatColors",
+	CurrentValue = true,
+	DependsOn = "CreatureESP",
+})
+PlayerBox:CreateToggle({
+	Name = "Hide smaller",
+	Desc = "Skip creatures under 90% of your size",
+	Flag = "HideSmaller",
+	CurrentValue = false,
+	DependsOn = "CreatureESP",
+})
+PlayerBox:CreateStatus({
+	Name = "Tracked",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		return string.format("<Success>%d</Success> <Muted>creatures</Muted>", stats.creatures)
+	end,
+})
+
+CritterBox:CreateToggle({
+	Name = "Critter ESP",
+	Desc = "Small prey animals that give meat",
+	Flag = "CritterESP",
+	CurrentValue = false,
+})
+CritterBox:CreateToggle({ Name = "Health", Flag = "CritterHealth", CurrentValue = true, DependsOn = "CritterESP" })
+CritterBox:CreateToggle({ Name = "Size", Flag = "CritterSize", CurrentValue = true, DependsOn = "CritterESP" })
+CritterBox:CreateToggle({ Name = "Distance", Flag = "CritterDistance", CurrentValue = true, DependsOn = "CritterESP" })
+CritterBox:CreateToggle({ Name = "Chams", Flag = "CritterChams", CurrentValue = true, DependsOn = "CritterESP" })
+CritterBox:CreateToggle({ Name = "Box", Flag = "CritterBox", CurrentValue = false, DependsOn = "CritterESP" })
+
+----- Resources tab -----
+
+local ResourcesTab = createTab("Resources", "eye")
+local MeatBox = ResourcesTab:CreateGroupbox({ Name = "Meat", Side = "Left" })
+local NodeBox = ResourcesTab:CreateGroupbox({ Name = "Food props", Side = "Left" })
+local FossilBox = ResourcesTab:CreateGroupbox({ Name = "Fossils", Side = "Right" })
+local DigBox = ResourcesTab:CreateGroupbox({ Name = "Dig sites", Side = "Right" })
+local NestBox = ResourcesTab:CreateGroupbox({ Name = "Nests", Side = "Right" })
+
+MeatBox:CreateToggle({
+	Name = "Carcass ESP",
+	Desc = "Meat left by dead creatures",
+	Flag = "CarcassESP",
+	CurrentValue = true,
+})
+MeatBox:CreateToggle({ Name = "Units", Flag = "CarcassUnits", CurrentValue = true, DependsOn = "CarcassESP" })
+MeatBox:CreateToggle({ Name = "Distance", Flag = "CarcassDistance", CurrentValue = true, DependsOn = "CarcassESP" })
+MeatBox:CreateToggle({ Name = "Chams", Flag = "CarcassChams", CurrentValue = false, DependsOn = "CarcassESP" })
+MeatBox:CreateToggle({
+	Name = "Hide rotten",
+	Desc = "Rotten meat feeds less",
+	Flag = "HideRotten",
+	CurrentValue = true,
+	DependsOn = "CarcassESP",
+})
+
+NodeBox:CreateToggle({
+	Name = "Food props ESP",
+	Desc = "Mineral and plant nodes you can eat",
+	Flag = "NodeESP",
+	CurrentValue = false,
+})
+NodeBox:CreateToggle({ Name = "Mineral", Flag = "NodeMineral", CurrentValue = true, DependsOn = "NodeESP" })
+NodeBox:CreateToggle({ Name = "Plant", Flag = "NodePlant", CurrentValue = true, DependsOn = "NodeESP" })
+NodeBox:CreateToggle({ Name = "Kind", Flag = "NodeKind", CurrentValue = true, DependsOn = "NodeESP" })
+NodeBox:CreateToggle({ Name = "Units", Flag = "NodeUnits", CurrentValue = true, DependsOn = "NodeESP" })
+NodeBox:CreateToggle({ Name = "Distance", Flag = "NodeDistance", CurrentValue = true, DependsOn = "NodeESP" })
+NodeBox:CreateToggle({ Name = "Chams", Flag = "NodeChams", CurrentValue = false, DependsOn = "NodeESP" })
+NodeBox:CreateSlider({
+	Name = "Min units",
+	Desc = "Hide nearly eaten nodes",
+	Range = { 0, 100 },
+	Increment = 1,
+	CurrentValue = 0,
+	Flag = "NodeMinUnits",
+})
+
+FossilBox:CreateToggle({
+	Name = "Fossil ESP",
+	Desc = "Bones with DNA inside",
+	Flag = "FossilESP",
+	CurrentValue = true,
+})
+FossilBox:CreateToggle({ Name = "Rarity", Flag = "FossilRarity", CurrentValue = true, DependsOn = "FossilESP" })
+FossilBox:CreateToggle({ Name = "Distance", Flag = "FossilDistance", CurrentValue = true, DependsOn = "FossilESP" })
+FossilBox:CreateToggle({ Name = "Chams", Flag = "FossilChams", CurrentValue = true, DependsOn = "FossilESP" })
+FossilBox:CreateDivider()
+FossilBox:CreateToggle({ Name = "Common", Flag = "FossilCommon", CurrentValue = true, DependsOn = "FossilESP" })
+FossilBox:CreateToggle({ Name = "Rare", Flag = "FossilRare", CurrentValue = true, DependsOn = "FossilESP" })
+FossilBox:CreateToggle({ Name = "Legendary", Flag = "FossilLegendary", CurrentValue = true, DependsOn = "FossilESP" })
+
+DigBox:CreateToggle({
+	Name = "Bone beds",
+	Desc = "Dig spots inside caves",
+	Flag = "DigESP",
+	CurrentValue = false,
+})
+DigBox:CreateToggle({ Name = "Distance", Flag = "DigDistance", CurrentValue = true, DependsOn = "DigESP" })
+DigBox:CreateToggle({ Name = "Chams", Flag = "DigChams", CurrentValue = false, DependsOn = "DigESP" })
+
+NestBox:CreateToggle({ Name = "Nest ESP", Desc = "Nests other players keep", Flag = "NestESP", CurrentValue = false })
+NestBox:CreateToggle({ Name = "Owner", Flag = "NestOwner", CurrentValue = true, DependsOn = "NestESP" })
+NestBox:CreateToggle({ Name = "Eggs", Flag = "NestEggs", CurrentValue = true, DependsOn = "NestESP" })
+NestBox:CreateToggle({ Name = "Zone", Flag = "NestZone", CurrentValue = true, DependsOn = "NestESP" })
+NestBox:CreateToggle({ Name = "Distance", Flag = "NestDistance", CurrentValue = true, DependsOn = "NestESP" })
+NestBox:CreateToggle({ Name = "Chams", Flag = "NestChams", CurrentValue = true, DependsOn = "NestESP" })
+
+----- Places tab -----
+
+local PlacesTab = createTab("Places", "eye")
+local PlaceBox = PlacesTab:CreateGroupbox({ Name = "Landmarks", Side = "Left" })
+local CaveBox = PlacesTab:CreateGroupbox({ Name = "Caves", Side = "Right" })
+local WarmBox = PlacesTab:CreateGroupbox({ Name = "Warm zones", Side = "Right" })
+
+PlaceBox:CreateToggle({
+	Name = "Places ESP",
+	Desc = "52 named spots on the map",
+	Flag = "PlaceESP",
+	CurrentValue = true,
+})
+PlaceBox:CreateToggle({ Name = "Biome", Flag = "PlaceBiome", CurrentValue = true, DependsOn = "PlaceESP" })
+PlaceBox:CreateToggle({ Name = "Kind", Flag = "PlaceKind", CurrentValue = true, DependsOn = "PlaceESP" })
+PlaceBox:CreateToggle({ Name = "Distance", Flag = "PlaceDistance", CurrentValue = true, DependsOn = "PlaceESP" })
+PlaceBox:CreateToggle({
+	Name = "Only major",
+	Desc = "Hide minor spots",
+	Flag = "PlaceOnlyMajor",
+	CurrentValue = false,
+	DependsOn = "PlaceESP",
+})
+
+CaveBox:CreateToggle({
+	Name = "Cave entrances",
+	Desc = "Ways into the cave network",
+	Flag = "CaveESP",
+	CurrentValue = true,
+})
+CaveBox:CreateToggle({ Name = "Kind", Flag = "CaveKind", CurrentValue = true, DependsOn = "CaveESP" })
+CaveBox:CreateToggle({ Name = "Distance", Flag = "CaveDistance", CurrentValue = true, DependsOn = "CaveESP" })
+
+WarmBox:CreateToggle({ Name = "Warm zones", Desc = "Hot spot zones that boost growth", Flag = "WarmESP", CurrentValue = false })
+WarmBox:CreateToggle({ Name = "Distance", Flag = "WarmDistance", CurrentValue = true, DependsOn = "WarmESP" })
+WarmBox:CreateToggle({ Name = "Chams", Flag = "WarmChams", CurrentValue = false, DependsOn = "WarmESP" })
+
+----- Style tab -----
+
+local StyleTab = Window:CreateTab({ Name = "Style", Icon = "palette" })
+local ColorBox = StyleTab:CreateGroupbox({ Name = "Colors", Side = "Left" })
+local LootColorBox = StyleTab:CreateGroupbox({ Name = "Loot colors", Side = "Left" })
+local RangeBox = StyleTab:CreateGroupbox({ Name = "Range", Side = "Right" })
+
+ColorBox:CreateColorPicker({ Name = "Creature", Color = COLOR_CREATURE, Flag = "CreatureColor" })
+ColorBox:CreateColorPicker({ Name = "Danger", Color = COLOR_DANGER, Flag = "DangerColor" })
+ColorBox:CreateColorPicker({ Name = "Threat", Color = COLOR_THREAT, Flag = "ThreatColor" })
+ColorBox:CreateColorPicker({ Name = "Prey", Color = COLOR_PREY, Flag = "PreyColor" })
+ColorBox:CreateColorPicker({ Name = "Critter", Color = COLOR_CRITTER, Flag = "CritterColor" })
+
+LootColorBox:CreateColorPicker({ Name = "Meat", Color = COLOR_MEAT, Flag = "MeatColor" })
+LootColorBox:CreateColorPicker({ Name = "Rotten", Color = COLOR_ROTTEN, Flag = "RottenColor" })
+LootColorBox:CreateColorPicker({ Name = "Mineral", Color = COLOR_MINERAL, Flag = "MineralColor" })
+LootColorBox:CreateColorPicker({ Name = "Plant", Color = COLOR_PLANT, Flag = "PlantColor" })
+LootColorBox:CreateColorPicker({ Name = "Fossil", Color = COLOR_FOSSIL, Flag = "FossilColor" })
+LootColorBox:CreateColorPicker({ Name = "Dig site", Color = COLOR_DIG, Flag = "DigColor" })
+LootColorBox:CreateColorPicker({ Name = "Nest", Color = COLOR_NEST, Flag = "NestColor" })
+
+RangeBox:CreateSlider({
+	Name = "Render distance",
+	Range = { 100, 6000 },
+	Increment = 100,
+	Suffix = " studs",
+	CurrentValue = 1400,
+	Flag = "RenderDistance",
+})
+RangeBox:CreateSlider({
+	Name = "Chams distance",
+	Range = { 50, 2000 },
+	Increment = 50,
+	Suffix = " studs",
+	CurrentValue = 450,
+	Flag = "ChamsDistance",
+})
+RangeBox:CreateSlider({
+	Name = "Chams budget",
+	Desc = "How many targets glow at once",
+	Range = { 10, 200 },
+	Increment = 10,
+	CurrentValue = 60,
+	Flag = "ChamsBudget",
+})
+RangeBox:CreateDropdown({
+	Name = "Distance from",
+	Options = { "Camera", "Character" },
+	CurrentOption = "Camera",
+	Flag = "DistanceFrom",
+	Desc = "Camera follows your creature, the character stays on the ground",
+})
+RangeBox:CreateDivider()
+RangeBox:CreateColorPicker({ Name = "Places", Color = COLOR_PLACE, Flag = "PlaceColor" })
+RangeBox:CreateColorPicker({ Name = "Caves", Color = COLOR_CAVE, Flag = "CaveColor" })
+RangeBox:CreateColorPicker({ Name = "Warm zone", Color = COLOR_WARM, Flag = "WarmColor" })
+RangeBox:CreateDivider()
+RangeBox:CreateButton({
+	Name = "Clear ESP",
+	Desc = "Remove every highlight and label",
+	Callback = function()
+		clearAllTargets()
+		Window:Notify({ Title = "Cleared", Content = "All ESP objects removed", Type = "Info" })
+	end,
+})
+RangeBox:CreateButton({
+	Name = "Unload",
+	Desc = "Close the interface and stop the ESP",
+	Style = "Primary",
+	Callback = function()
+		local api = getgenv().RobScriptCambria
+		if type(api) == "table" and type(api.Destroy) == "function" then
+			api.Destroy()
+		end
+	end,
+})
+
+----- Settings tab -----
+
+local SettingsTab = Window:CreateTab({ Name = "Settings", Icon = "settings" })
+SettingsTab:CreateConfigManager({ Name = "Configs", Side = "Left" })
+SettingsTab:CreateThemeManager({ Name = "Theme", Side = "Right" })
+
+----- Runtime -----
+
+resetFlagCache()
+
+local collectAccumulator = 0
+local renderAccumulator = 0
+local chamsAccumulator = 0
+
+local heartbeat = RunService.Heartbeat:Connect(function(deltaTime)
+	if not running then
+		return
+	end
+	collectAccumulator = collectAccumulator + deltaTime
+	renderAccumulator = renderAccumulator + deltaTime
+	chamsAccumulator = chamsAccumulator + deltaTime
+
+	if collectAccumulator >= COLLECT_INTERVAL then
+		collectAccumulator = 0
+		pcall(collectTargets)
+	end
+
+	local chamsDistance = flag("ChamsDistance", 450)
+	if chamsAccumulator >= COLLECT_INTERVAL then
+		chamsAccumulator = 0
+		pcall(refreshChamsBudget, chamsDistance, flag("ChamsBudget", 60))
+	end
+	if renderAccumulator >= RENDER_INTERVAL then
+		renderAccumulator = 0
+		local origin = distanceOrigin()
+		local settings = readSettings()
+		for _, target in pairs(targets) do
+			pcall(updateTarget, target, origin, settings)
+		end
+	end
+end)
+
+local inputConnection = UserInputService.InputBegan:Connect(function(input, processed)
+	if processed or not running then
+		return
+	end
+	if input.KeyCode == Enum.KeyCode.End then
+		pcall(function()
+			setFlag("CreatureESP", false)
+			setFlag("CarcassESP", false)
+			setFlag("NodeESP", false)
+			setFlag("FossilESP", false)
+			setFlag("DigESP", false)
+			setFlag("NestESP", false)
+			setFlag("PlaceESP", false)
+			setFlag("CaveESP", false)
+			setFlag("WarmESP", false)
+			setFlag("CritterESP", false)
+			clearAllTargets()
+		end)
+	end
+end)
+
+----- Teardown -----
+
+local function destroy()
+	if not running then
+		return
+	end
+	running = false
+	pcall(function()
+		heartbeat:Disconnect()
+	end)
+	pcall(function()
+		inputConnection:Disconnect()
+	end)
+	clearAllTargets()
+	pcall(function()
+		Window:Destroy()
+	end)
+	Airflow = nil
+	if getgenv().RobScriptCambria then
+		getgenv().RobScriptCambria = nil
+	end
+end
+
+----- Public interface -----
+
+getgenv().RobScriptCambria = {
+	Version = "1.0",
+	Actions = {
+		Refresh = collectTargets,
+		Clear = clearAllTargets,
+		Destroy = destroy,
+	},
+	GetStats = function()
+		return {
+			creatures = stats.creatures,
+			resources = stats.resources,
+			places = stats.places,
+			targets = (function()
+				local count = 0
+				for _ in pairs(targets) do
+					count = count + 1
+				end
+				return count
+			end)(),
+		}
+	end,
+	Get = function(name, fallback)
+		return flag(name, fallback)
+	end,
+	Set = function(name, value)
+		return setFlag(name, value)
+	end,
+	GetTargets = function()
+		local list = {}
+		for _, target in pairs(targets) do
+			local category = target.spec and target.spec.cat or "?"
+			list[#list + 1] = {
+				kind = category,
+				name = (target.player and target.player.Name)
+					or (target.place and target.place.name)
+					or (target.instance and target.instance.Name)
+					or (target.spec and (target.spec.cat .. " " .. tostring(target.key)))
+					or "?",
+				distance = target.distance,
+				visible = target.hasVisual,
+				billboard = target.billboard ~= nil and target.billboard.Enabled or false,
+				chams = target.highlight ~= nil,
+				text = target.text,
+			}
+		end
+		return list
+	end,
+	Destroy = destroy,
+}
+
+----- Boot -----
+
+pcall(function()
+	Window:LoadAutoload()
+end)
+
+Window:Notify({ Title = "Robscript Team", Content = "Cambria ESP is ready", Type = "Success" })
+
+return getgenv().RobScriptCambria
