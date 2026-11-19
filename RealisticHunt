@@ -1,0 +1,1195 @@
+-- Robscript Team - Realistic Hunting ESP
+-- Game: Realistic Hunting | placeId 116884863643647 | gameId 10773150670
+-- Window: RightControl | Panic: End | API: getgenv().RobScriptRH
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+
+local LocalPlayer = Players.LocalPlayer
+
+-- Unload a previous copy so its loops, drawings and highlights die first.
+do
+	local existing = getgenv().RobScriptRH
+	if type(existing) == "table" and type(existing.Destroy) == "function" then
+		pcall(existing.Destroy)
+	end
+end
+
+----- Library -----
+
+local LIBRARY_URLS = {
+	"https://raw.githubusercontent.com/bobloscript/Robly_Airflow/main/Source.luau",
+	"https://raw.githubusercontent.com/PookiePepelsss/Airflow-UI/refs/heads/main/Source.luau",
+}
+
+-- Both mirrors are published, but only one still ships the groupbox and status
+-- elements this interface is built from. Load whatever works and prefer the
+-- build that has ThemePresets, which is the marker for the full layout API.
+local Airflow = nil
+local fallbackLibrary = nil
+for _, url in ipairs(LIBRARY_URLS) do
+	local ok, library = pcall(function()
+		return loadstring(game:HttpGet(url))()
+	end)
+	if ok and type(library) == "table" and type(library.CreateWindow) == "function" then
+		if not fallbackLibrary then
+			fallbackLibrary = library
+		end
+		if type(library.ThemePresets) == "table" then
+			Airflow = library
+			break
+		end
+	end
+end
+
+Airflow = Airflow or fallbackLibrary
+
+if not Airflow then
+	error("[RobScript RH] Airflow UI could not be loaded")
+end
+
+----- Theme -----
+
+local THEME = {
+	Background = Color3.fromHex("#0A0A0C"),
+	Surface = Color3.fromHex("#141418"),
+	Surface2 = Color3.fromHex("#1A1A20"),
+	Surface3 = Color3.fromHex("#2A2A33"),
+	Stroke = Color3.fromHex("#26262E"),
+	StrokeHover = Color3.fromHex("#3C3C49"),
+	Accent = Color3.fromHex("#FF3B7F"),
+	AccentDark = Color3.fromHex("#1A0710"),
+	Text = Color3.fromHex("#F5F5F7"),
+	Muted = Color3.fromHex("#8D8D99"),
+}
+
+-- Airflow ships two theme APIs: the new AddTheme/SetTheme pair and the older
+-- ThemePresets/SetDefaultTheme pair. Support both so a mirror update cannot
+-- break the window, and always merge over the library defaults so keys such
+-- as Success, Warning, Error and Glow stay valid.
+local ThemeValue = THEME
+do
+	local merged = {}
+	for key, value in pairs(Airflow.Theme or {}) do
+		merged[key] = value
+	end
+	for key, value in pairs(THEME) do
+		merged[key] = value
+	end
+	if type(Airflow.AddTheme) == "function" and type(Airflow.SetTheme) == "function" then
+		local ok = pcall(function()
+			Airflow:AddTheme("Robscript", merged)
+			Airflow:SetTheme("Robscript")
+		end)
+		if ok then
+			ThemeValue = "Robscript"
+		end
+	elseif type(Airflow.ThemePresets) == "table" then
+		Airflow.ThemePresets.Robscript = merged
+		pcall(function()
+			Airflow:SetDefaultTheme("Robscript")
+		end)
+	end
+end
+
+----- Language -----
+
+pcall(function()
+	Airflow:AddLanguage("ru", {
+		Name = "Русский",
+		Flag = "ru",
+		Strings = {
+			["Visuals"] = "Визуал",
+			["Style"] = "Стиль",
+			["Settings"] = "Настройки",
+			["Animals"] = "Животные",
+			["Hunters"] = "Охотники",
+			["Colors"] = "Цвета",
+			["Range"] = "Дальность",
+			["Animal ESP"] = "ESP животных",
+			["Draw every streamed animal in your area"] = "Показывает всех животных в зоне стриминга",
+			["Hunter ESP"] = "ESP игроков",
+			["Draw the other hunters in the server"] = "Показывает других игроков в сервере",
+			["Name"] = "Имя",
+			["Info"] = "Данные",
+			["Distance"] = "Дистанция",
+			["Chams"] = "Подсветка",
+			["Box"] = "Рамка",
+			["Tracer"] = "Линия",
+			["Show dead"] = "Показывать добытых",
+			["Keep harvested animals on the list"] = "Оставляет убитых животных в списке",
+			["Species filter"] = "Фильтр видов",
+			["Leave empty to show every species"] = "Пусто — показывать все виды",
+			["Tracked"] = "В списке",
+			["Render distance"] = "Дистанция отрисовки",
+			["Distance from"] = "Дистанция от",
+			["Camera"] = "Камеры",
+			["Character"] = "Персонажа",
+			["Clear visuals"] = "Убрать отрисовку",
+			["Remove every box, label and highlight"] = "Убирает все рамки, подписи и подсветку",
+			["Unload"] = "Выгрузить",
+			["Close the interface and stop everything"] = "Закрывает интерфейс и останавливает скрипт",
+			["Animal"] = "Животное",
+			["Dead"] = "Добытое",
+			["Hunter"] = "Игрок",
+			["Robscript Team"] = "Robscript Team",
+			["Realistic Hunting ESP is ready"] = "Realistic Hunting ESP готов",
+			["Cleared"] = "Очищено",
+			["All ESP objects removed"] = "Вся отрисовка убрана",
+			["animals"] = "животных",
+			["hunters"] = "игроков",
+			["studs"] = "студов",
+			["Buck"] = "Олень-самец",
+			["Doe"] = "Лань",
+			["Deer"] = "Олень",
+			["Elk"] = "Лось",
+			["Wolf"] = "Волк",
+			["Fox"] = "Лиса",
+			["Racoon"] = "Енот",
+			["Rabbit"] = "Кролик",
+			["Duck"] = "Утка",
+			["Pheasant"] = "Фазан",
+			["bedded"] = "лежит",
+			["alert"] = "настороже",
+			["fleeing"] = "убегает",
+			["wounded"] = "ранен",
+			["dead"] = "добыт",
+		},
+	})
+end)
+
+----- Constants -----
+
+local COLLECT_INTERVAL = 0.35
+local VISUAL_INTERVAL = 0.022
+
+local COLOR_DEFAULT_ANIMAL = Color3.fromRGB(255, 98, 140)
+local COLOR_DEFAULT_DEAD = Color3.fromRGB(150, 150, 160)
+local COLOR_DEFAULT_PLAYER = Color3.fromRGB(90, 214, 255)
+local COLOR_DEFAULT_TRACER = Color3.fromRGB(255, 98, 140)
+
+local GRADE_COLORS = {
+	Bronze = Color3.fromRGB(199, 123, 74),
+	Silver = Color3.fromRGB(199, 207, 216),
+	Gold = Color3.fromRGB(255, 201, 74),
+}
+
+-- Per-species tint, so the frame alone tells the species apart.
+local SPECIES_COLORS = {
+	Buck = Color3.fromRGB(255, 159, 69),
+	Doe = Color3.fromRGB(255, 201, 138),
+	Deer = Color3.fromRGB(232, 177, 92),
+	Elk = Color3.fromRGB(185, 138, 77),
+	Wolf = Color3.fromRGB(143, 179, 255),
+	Fox = Color3.fromRGB(255, 122, 90),
+	Racoon = Color3.fromRGB(168, 168, 184),
+	Rabbit = Color3.fromRGB(156, 255, 176),
+	Duck = Color3.fromRGB(111, 232, 255),
+	Pheasant = Color3.fromRGB(192, 139, 255),
+}
+
+local SPECIES_OPTIONS = { "Buck", "Doe", "Deer", "Elk", "Wolf", "Fox", "Racoon", "Rabbit", "Duck", "Pheasant" }
+
+-- Fallback { height, width } in studs, used until a species is measured.
+local SPECIES_EXTENT = {
+	Duck = { 1.5, 2.2 },
+	Rabbit = { 2.2, 1.8 },
+	Pheasant = { 1.8, 2.4 },
+	Racoon = { 2.4, 2.2 },
+	Fox = { 2.8, 4.2 },
+	Wolf = { 3.4, 5.6 },
+	Doe = { 6.8, 5.6 },
+	Deer = { 7.4, 6.2 },
+	Buck = { 9.0, 6.8 },
+	Elk = { 9.6, 7.2 },
+}
+
+local PLAYER_BOX = { height = 5.2, width = 2.6 }
+
+----- Flags -----
+
+local flagCache = {}
+
+local function resetFlagCache()
+	flagCache = {}
+end
+
+local function getFlag(name)
+	local cached = flagCache[name]
+	if cached ~= nil then
+		return cached ~= false and cached or nil
+	end
+	local container = Airflow.Flags
+	local entry = type(container) == "table" and container[name] or nil
+	if type(entry) == "table" then
+		flagCache[name] = entry
+		return entry
+	end
+	flagCache[name] = false
+	return nil
+end
+
+local function flag(name, fallback)
+	local entry = getFlag(name)
+	if not entry then
+		return fallback
+	end
+	local ok, value = pcall(function()
+		return entry:Get()
+	end)
+	if ok and value ~= nil then
+		return value
+	end
+	return fallback
+end
+
+local function setFlag(name, value)
+	local entry = getFlag(name)
+	if not entry then
+		return false
+	end
+	return (pcall(function()
+		entry:Set(value)
+	end))
+end
+
+----- Helpers -----
+
+local function formatDistance(studs)
+	if studs >= 1000 then
+		return string.format("%.1fk", studs / 1000)
+	end
+	return string.format("%dm", math.floor(studs + 0.5))
+end
+
+local function distanceOrigin()
+	if flag("DistanceFrom", "Camera") == "Character" then
+		local character = LocalPlayer.Character
+		local root = character and character:FindFirstChild("HumanoidRootPart")
+		if root then
+			return root.Position
+		end
+	end
+	local camera = workspace.CurrentCamera
+	if camera then
+		return camera.CFrame.Position
+	end
+	return Vector3.zero
+end
+
+local function animalsFolder()
+	local folder = workspace:FindFirstChild("Animals")
+	if folder and folder:IsA("Folder") then
+		return folder
+	end
+	for _, child in ipairs(workspace:GetChildren()) do
+		if child:IsA("Folder") then
+			local first = child:GetChildren()[1]
+			if first and first:GetAttribute("Species") ~= nil then
+				return child
+			end
+		end
+	end
+	return nil
+end
+
+local function adorneePart(model)
+	local primary = model.PrimaryPart
+	if primary then
+		return primary
+	end
+	local named = model:FindFirstChild("RootPart") or model:FindFirstChild("Body")
+	if named and named:IsA("BasePart") then
+		return named
+	end
+	for _, child in ipairs(model:GetChildren()) do
+		if child:IsA("BasePart") then
+			return child
+		end
+	end
+	return nil
+end
+
+-- This game uses a 7.1 stud cube named RootPart as a hitbox, so it must never
+-- feed the visual bounds: it would turn every deer into a square blob.
+local extentCache = {}
+
+local function animalExtent(model)
+	local species = model:GetAttribute("Species") or model.Name
+	local cached = extentCache[species]
+	if cached then
+		return cached
+	end
+	local fallback = SPECIES_EXTENT[species] or { 3, 3 }
+	local lying = model:GetAttribute("Anim") == "LyingIdle"
+	local minY, maxY = math.huge, -math.huge
+	local minX, maxX, minZ, maxZ = math.huge, -math.huge, math.huge, -math.huge
+	local any = false
+	if not lying then
+		for _, part in ipairs(model:GetDescendants()) do
+			if part:IsA("BasePart") and part.Name ~= "RootPart" then
+				any = true
+				local position, size = part.Position, part.Size
+				minY = math.min(minY, position.Y - size.Y * 0.5)
+				maxY = math.max(maxY, position.Y + size.Y * 0.5)
+				minX = math.min(minX, position.X - size.X * 0.5)
+				maxX = math.max(maxX, position.X + size.X * 0.5)
+				minZ = math.min(minZ, position.Z - size.Z * 0.5)
+				maxZ = math.max(maxZ, position.Z + size.Z * 0.5)
+			end
+		end
+	end
+	local height, width = fallback[1], fallback[2]
+	local bottomOffset = -height * 0.4
+	local base = model:GetAttribute("P")
+	local hasBase = typeof(base) == "Vector3"
+	if any then
+		local measuredHeight = maxY - minY
+		local measuredWidth = math.max(maxX - minX, maxZ - minZ)
+		if measuredHeight > 0.2 then
+			height = measuredHeight
+		end
+		if measuredWidth > 0.2 then
+			width = measuredWidth
+		end
+		if hasBase then
+			bottomOffset = minY - base.Y
+		end
+	end
+	height = math.clamp(height, fallback[1] * 0.55, fallback[1] * 1.7)
+	width = math.clamp(width, fallback[2] * 0.6, fallback[2] * 1.8)
+	bottomOffset = math.clamp(bottomOffset, -height * 0.9, -height * 0.05)
+	local extent = {
+		height = height,
+		width = width,
+		aspect = width / math.max(height, 0.1),
+		bottomOffset = bottomOffset,
+	}
+	if not lying then
+		extentCache[species] = extent
+	end
+	return extent
+end
+
+----- Drawing -----
+
+local DrawingLib = nil
+if type(Drawing) == "table" and type(Drawing.new) == "function" then
+	DrawingLib = Drawing
+end
+
+local function newLine()
+	if not DrawingLib then
+		return nil
+	end
+	local ok, line = pcall(DrawingLib.new, "Line")
+	if ok and line then
+		line.Visible = false
+		return line
+	end
+	return nil
+end
+
+local function newText()
+	if not DrawingLib then
+		return nil
+	end
+	local ok, text = pcall(DrawingLib.new, "Text")
+	if ok and text then
+		text.Visible = false
+		text.Center = true
+		text.Outline = true
+		text.OutlineColor = Color3.fromRGB(0, 0, 0)
+		text.Size = 14
+		return text
+	end
+	return nil
+end
+
+local function releaseLine(line)
+	if not line then
+		return
+	end
+	pcall(function()
+		line.Visible = false
+		line:Remove()
+	end)
+end
+
+local function releaseText(text)
+	if not text then
+		return
+	end
+	pcall(function()
+		text.Visible = false
+		text:Remove()
+	end)
+end
+
+----- State -----
+
+local animalTargets = {}
+local hunterTargets = {}
+local stats = { tracked = 0, hunters = 0, drawn = 0 }
+local running = true
+
+----- Projection -----
+
+local function projectPoint(position)
+	local camera = workspace.CurrentCamera
+	if not camera then
+		return nil, false
+	end
+	local point, onScreen = camera:WorldToViewportPoint(position)
+	return point, (onScreen and point.Z > 0)
+end
+
+-- Returns a screen rectangle for a world-space segment, or nil when the
+-- segment is off screen, behind the camera or too small to read.
+local function screenRect(top, bottom, aspect)
+	local topPoint, topVisible = projectPoint(top)
+	local bottomPoint, bottomVisible = projectPoint(bottom)
+	if not topVisible or not bottomVisible then
+		return nil
+	end
+	local pixelHeight = math.abs(bottomPoint.Y - topPoint.Y)
+	if pixelHeight < 3 then
+		return nil
+	end
+	local pixelWidth = math.max(pixelHeight * aspect, 5)
+	local centerX = (topPoint.X + bottomPoint.X) * 0.5
+	return {
+		left = centerX - pixelWidth * 0.5,
+		right = centerX + pixelWidth * 0.5,
+		top = math.min(topPoint.Y, bottomPoint.Y),
+		bottom = math.max(topPoint.Y, bottomPoint.Y),
+		centerX = centerX,
+		height = pixelHeight,
+	}
+end
+
+local function hideLines(lines)
+	for _, line in ipairs(lines) do
+		if line then
+			line.Visible = false
+		end
+	end
+end
+
+local function paintRect(lines, rect, color)
+	if not lines[1] or not rect then
+		return false
+	end
+	local corners = {
+		{ Vector2.new(rect.left, rect.top), Vector2.new(rect.right, rect.top) },
+		{ Vector2.new(rect.right, rect.top), Vector2.new(rect.right, rect.bottom) },
+		{ Vector2.new(rect.right, rect.bottom), Vector2.new(rect.left, rect.bottom) },
+		{ Vector2.new(rect.left, rect.bottom), Vector2.new(rect.left, rect.top) },
+	}
+	for index, line in ipairs(lines) do
+		local corner = corners[index]
+		line.From = corner[1]
+		line.To = corner[2]
+		line.Color = color
+		line.Thickness = 1
+		line.Transparency = 1
+		line.Visible = true
+	end
+	return true
+end
+
+local function paintTracer(line, from, to, color)
+	if not line then
+		return
+	end
+	line.From = from
+	line.To = to
+	line.Color = color
+	line.Thickness = 1
+	line.Transparency = 1
+	line.Visible = true
+end
+
+----- Visual objects -----
+
+local function ensureHighlight(target, adornee, color)
+	if target.highlight and target.highlight.Parent ~= adornee then
+		pcall(function()
+			target.highlight:Destroy()
+		end)
+		target.highlight = nil
+	end
+	if not target.highlight then
+		local highlight = Instance.new("Highlight")
+		highlight.Name = "RH_Chams"
+		highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+		highlight.FillTransparency = 0.65
+		highlight.OutlineTransparency = 1
+		highlight.Adornee = adornee
+		highlight.Parent = adornee
+		target.highlight = highlight
+	end
+	target.highlight.FillColor = color
+	target.highlight.Enabled = true
+end
+
+local function ensureAnimalTarget(model)
+	local target = animalTargets[model]
+	if target then
+		return target
+	end
+	target = {
+		model = model,
+		box = { newLine(), newLine(), newLine(), newLine() },
+		nameText = newText(),
+		infoText = newText(),
+		tracer = newLine(),
+		highlight = nil,
+	}
+	animalTargets[model] = target
+	return target
+end
+
+local function ensureHunterTarget(player)
+	local target = hunterTargets[player]
+	if target then
+		return target
+	end
+	target = {
+		player = player,
+		box = { newLine(), newLine(), newLine(), newLine() },
+		nameText = newText(),
+		infoText = newText(),
+		tracer = newLine(),
+		highlight = nil,
+	}
+	hunterTargets[player] = target
+	return target
+end
+
+local function hideTarget(target)
+	hideLines(target.box)
+	if target.tracer then
+		target.tracer.Visible = false
+	end
+	if target.nameText then
+		target.nameText.Visible = false
+	end
+	if target.infoText then
+		target.infoText.Visible = false
+	end
+	if target.highlight then
+		target.highlight.Enabled = false
+	end
+end
+
+local function releaseTarget(target)
+	hideTarget(target)
+	for _, line in ipairs(target.box) do
+		releaseLine(line)
+	end
+	releaseLine(target.tracer)
+	releaseText(target.nameText)
+	releaseText(target.infoText)
+	if target.highlight then
+		pcall(function()
+			target.highlight:Destroy()
+		end)
+		target.highlight = nil
+	end
+end
+
+----- Collection -----
+
+local function collectAnimals()
+	local folder = animalsFolder()
+	if not folder then
+		return
+	end
+	local showDead = flag("ShowDead", false)
+	local filter = flag("SpeciesFilter", nil)
+	local allowed = nil
+	if type(filter) == "table" and #filter > 0 then
+		allowed = {}
+		for _, species in ipairs(filter) do
+			allowed[species] = true
+		end
+	end
+
+	local seen = {}
+	local tracked = 0
+	for _, model in ipairs(folder:GetChildren()) do
+		if model:IsA("Model") then
+			local dead = model:GetAttribute("Dead") == true
+			local species = model:GetAttribute("Species") or model.Name
+			if (showDead or not dead) and (not allowed or allowed[species]) then
+				seen[model] = true
+				tracked = tracked + 1
+				local target = ensureAnimalTarget(model)
+				target.species = species
+				target.dead = dead
+				target.label = model:GetAttribute("Id") or species
+				target.grade = model:GetAttribute("Grade")
+				target.sex = model:GetAttribute("Sex")
+				target.weight = model:GetAttribute("WeightKg")
+				target.wounded = model:GetAttribute("Wounded") == true
+				target.bedded = model:GetAttribute("Bedded") == true
+				target.alert = model:GetAttribute("Alert") == true
+				target.fleeing = model:GetAttribute("Fleeing") == true
+				local extent = animalExtent(model)
+				target.height = extent.height
+				target.aspect = extent.aspect
+				target.bottomOffset = extent.bottomOffset
+				target.baseColor = SPECIES_COLORS[species] or COLOR_DEFAULT_ANIMAL
+				target.gradeColor = GRADE_COLORS[target.grade] or target.baseColor
+			end
+		end
+	end
+
+	for model, target in pairs(animalTargets) do
+		if not seen[model] or not model.Parent then
+			releaseTarget(target)
+			animalTargets[model] = nil
+		end
+	end
+	stats.tracked = tracked
+end
+
+local function collectHunters()
+	local seen = {}
+	local count = 0
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player ~= LocalPlayer and player.Character then
+			local root = player.Character:FindFirstChild("HumanoidRootPart")
+			if root then
+				seen[player] = true
+				count = count + 1
+				ensureHunterTarget(player)
+			end
+		end
+	end
+	for player, target in pairs(hunterTargets) do
+		if not seen[player] or not player.Parent then
+			releaseTarget(target)
+			hunterTargets[player] = nil
+		end
+	end
+	stats.hunters = count
+end
+
+----- Per-frame updates -----
+
+local function updateAnimal(target, session, origin)
+	local model = target.model
+	if not model or not model.Parent then
+		return false
+	end
+	local base = model:GetAttribute("P")
+	if typeof(base) ~= "Vector3" then
+		local part = adorneePart(model)
+		if not part then
+			hideTarget(target)
+			return false
+		end
+		base = part.Position
+	end
+	local distance = (base - origin).Magnitude
+	if distance > session.maxDistance then
+		hideTarget(target)
+		return false
+	end
+
+	if session.chams then
+		ensureHighlight(target, model, target.dead and session.deadColor or target.baseColor)
+	end
+
+	local bottom = base + Vector3.new(0, target.bottomOffset, 0)
+	local top = bottom + Vector3.new(0, target.height, 0)
+	local rect = screenRect(top, bottom, target.aspect)
+	if not rect then
+		hideLines(target.box)
+		if target.tracer then
+			target.tracer.Visible = false
+		end
+		if target.nameText then
+			target.nameText.Visible = false
+		end
+		if target.infoText then
+			target.infoText.Visible = false
+		end
+		return false
+	end
+
+	local color = target.dead and session.deadColor or target.baseColor
+	if session.box then
+		paintRect(target.box, rect, color)
+	else
+		hideLines(target.box)
+	end
+
+	if session.name and target.nameText then
+		local text = target.label
+		if session.distance then
+			text = string.format("%s  |  %s", text, formatDistance(distance))
+		end
+		target.nameText.Text = text
+		target.nameText.Color = target.dead and session.deadColor or target.gradeColor
+		target.nameText.Size = 15
+		target.nameText.Position = Vector2.new(rect.centerX, rect.top - 16)
+		target.nameText.Visible = true
+	elseif target.nameText then
+		target.nameText.Visible = false
+	end
+
+	if session.info and target.infoText then
+		local pieces = {}
+		if target.grade then
+			pieces[#pieces + 1] = target.grade
+		end
+		if target.weight then
+			pieces[#pieces + 1] = string.format("%.1f kg", target.weight)
+		end
+		if target.sex == "Male" then
+			pieces[#pieces + 1] = "M"
+		elseif target.sex == "Female" then
+			pieces[#pieces + 1] = "F"
+		end
+		if target.bedded then
+			pieces[#pieces + 1] = "bedded"
+		end
+		if target.alert then
+			pieces[#pieces + 1] = "alert"
+		end
+		if target.fleeing then
+			pieces[#pieces + 1] = "fleeing"
+		end
+		if target.wounded then
+			pieces[#pieces + 1] = "wounded"
+		end
+		if target.dead then
+			pieces[#pieces + 1] = "dead"
+		end
+		target.infoText.Text = table.concat(pieces, "   ")
+		target.infoText.Color = Color3.fromRGB(232, 232, 240)
+		target.infoText.Size = 13
+		target.infoText.Position = Vector2.new(rect.centerX, rect.bottom + 6)
+		target.infoText.Visible = true
+	elseif target.infoText then
+		target.infoText.Visible = false
+	end
+
+	if session.tracer then
+		paintTracer(target.tracer, session.tracerOrigin, Vector2.new(rect.centerX, rect.bottom), session.tracerColor)
+	elseif target.tracer then
+		target.tracer.Visible = false
+	end
+	return true
+end
+
+local function updateHunter(target, session, origin)
+	local player = target.player
+	local character = player and player.Character
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	if not root then
+		hideTarget(target)
+		return false
+	end
+	local base = root.Position
+	local distance = (base - origin).Magnitude
+	if distance > session.maxDistance then
+		hideTarget(target)
+		return false
+	end
+
+	if session.chams then
+		ensureHighlight(target, character, session.hunterColor)
+	end
+
+	local bottom = base - Vector3.new(0, PLAYER_BOX.height * 0.5, 0)
+	local top = base + Vector3.new(0, PLAYER_BOX.height * 0.5, 0)
+	local rect = screenRect(top, bottom, PLAYER_BOX.width / PLAYER_BOX.height)
+	if not rect then
+		hideLines(target.box)
+		if target.tracer then
+			target.tracer.Visible = false
+		end
+		if target.nameText then
+			target.nameText.Visible = false
+		end
+		if target.infoText then
+			target.infoText.Visible = false
+		end
+		return false
+	end
+
+	if session.box then
+		paintRect(target.box, rect, session.hunterColor)
+	else
+		hideLines(target.box)
+	end
+
+	if session.name and target.nameText then
+		local text = player.Name
+		if session.distance then
+			text = string.format("%s  |  %s", text, formatDistance(distance))
+		end
+		target.nameText.Text = text
+		target.nameText.Color = session.hunterColor
+		target.nameText.Size = 15
+		target.nameText.Position = Vector2.new(rect.centerX, rect.top - 16)
+		target.nameText.Visible = true
+	elseif target.nameText then
+		target.nameText.Visible = false
+	end
+	if target.infoText then
+		target.infoText.Visible = false
+	end
+
+	if session.tracer then
+		paintTracer(target.tracer, session.tracerOrigin, Vector2.new(rect.centerX, rect.bottom), session.tracerColor)
+	elseif target.tracer then
+		target.tracer.Visible = false
+	end
+	return true
+end
+
+----- Session -----
+
+local function buildSession()
+	local camera = workspace.CurrentCamera
+	local viewport = camera and camera.ViewportSize or Vector2.new(1920, 1080)
+	return {
+		origin = distanceOrigin(),
+		maxDistance = flag("RenderDistance", 1500),
+		box = flag("AnimalBox", true),
+		name = flag("AnimalName", true),
+		info = flag("AnimalInfo", true),
+		distance = flag("AnimalDistance", true),
+		chams = flag("AnimalChams", true),
+		tracer = flag("AnimalTracer", false),
+		tracerColor = flag("TracerColor", COLOR_DEFAULT_TRACER),
+		tracerOrigin = Vector2.new(viewport.X * 0.5, viewport.Y),
+		deadColor = flag("DeadColor", COLOR_DEFAULT_DEAD),
+		hunterEnabled = flag("HunterESP", false),
+		hunterBox = flag("HunterBox", true),
+		hunterName = flag("HunterName", true),
+		hunterDistance = flag("HunterDistance", true),
+		hunterChams = flag("HunterChams", true),
+		hunterTracer = flag("HunterTracer", false),
+		hunterColor = flag("HunterColor", COLOR_DEFAULT_PLAYER),
+	}
+end
+
+local function clearAll()
+	for model, target in pairs(animalTargets) do
+		releaseTarget(target)
+		animalTargets[model] = nil
+	end
+	for player, target in pairs(hunterTargets) do
+		releaseTarget(target)
+		hunterTargets[player] = nil
+	end
+	stats.tracked = 0
+	stats.hunters = 0
+	stats.drawn = 0
+end
+
+local function refresh()
+	local session = buildSession()
+
+	local drawn = 0
+	if flag("AnimalESP", true) then
+		for _, target in pairs(animalTargets) do
+			local ok, visible = pcall(updateAnimal, target, session, session.origin)
+			if ok and visible then
+				drawn = drawn + 1
+			end
+		end
+	else
+		for _, target in pairs(animalTargets) do
+			hideTarget(target)
+		end
+	end
+	stats.drawn = drawn
+
+	local hunterSession = {
+		maxDistance = session.maxDistance,
+		box = session.hunterBox,
+		name = session.hunterName,
+		distance = session.hunterDistance,
+		chams = session.hunterChams,
+		tracer = session.hunterTracer,
+		tracerColor = session.tracerColor,
+		tracerOrigin = session.tracerOrigin,
+		hunterColor = session.hunterColor,
+	}
+	if session.hunterEnabled then
+		for _, target in pairs(hunterTargets) do
+			pcall(updateHunter, target, hunterSession, session.origin)
+		end
+	else
+		for _, target in pairs(hunterTargets) do
+			hideTarget(target)
+		end
+	end
+end
+
+----- Interface -----
+
+local Window = Airflow:CreateWindow({
+	Name = "Robscript Team",
+	LoadingSubtitle = "realistic hunting - esp",
+	ToggleUIKeybind = "RightControl",
+	Size = UDim2.fromOffset(780, 540),
+	Theme = ThemeValue,
+	Density = "Compact",
+	Backdrop = { Weather = "Fireflies", Tint = 0.35 },
+	ConfigurationSaving = { Enabled = true, FolderName = "RobScriptRH" },
+	Home = {
+		Title = "Robscript Team",
+		Welcome = "Welcome back,",
+		Tier = "ESP 1.0",
+		Stats = { "Players", "Session", "FPS", "Ping", "Game", "Executor" },
+	},
+})
+
+local VisualsTab = Window:CreateTab({ Name = "Visuals", Icon = "eye" })
+local AnimalsBox = VisualsTab:CreateGroupbox({ Name = "Animals", Side = "Left" })
+local HuntersBox = VisualsTab:CreateGroupbox({ Name = "Hunters", Side = "Right" })
+
+AnimalsBox:CreateToggle({
+	Name = "Animal ESP",
+	Desc = "Draw every streamed animal in your area",
+	Flag = "AnimalESP",
+	CurrentValue = true,
+})
+AnimalsBox:CreateToggle({ Name = "Name", Flag = "AnimalName", CurrentValue = true, DependsOn = "AnimalESP" })
+AnimalsBox:CreateToggle({ Name = "Info", Flag = "AnimalInfo", CurrentValue = true, DependsOn = "AnimalESP" })
+AnimalsBox:CreateToggle({ Name = "Distance", Flag = "AnimalDistance", CurrentValue = true, DependsOn = "AnimalESP" })
+AnimalsBox:CreateToggle({ Name = "Chams", Flag = "AnimalChams", CurrentValue = true, DependsOn = "AnimalESP" })
+AnimalsBox:CreateToggle({ Name = "Box", Flag = "AnimalBox", CurrentValue = true, DependsOn = "AnimalESP" })
+AnimalsBox:CreateToggle({ Name = "Tracer", Flag = "AnimalTracer", CurrentValue = false, DependsOn = "AnimalESP" })
+AnimalsBox:CreateDivider()
+AnimalsBox:CreateToggle({
+	Name = "Show dead",
+	Desc = "Keep harvested animals on the list",
+	Flag = "ShowDead",
+	CurrentValue = false,
+	DependsOn = "AnimalESP",
+})
+AnimalsBox:CreateDropdown({
+	Name = "Species filter",
+	Desc = "Leave empty to show every species",
+	Options = SPECIES_OPTIONS,
+	MultipleOptions = true,
+	Flag = "SpeciesFilter",
+	DependsOn = "AnimalESP",
+})
+AnimalsBox:CreateStatus({
+	Name = "Tracked",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		return string.format("<Success>%d</Success> <Muted>animals</Muted>", stats.tracked)
+	end,
+})
+
+HuntersBox:CreateToggle({
+	Name = "Hunter ESP",
+	Desc = "Draw the other hunters in the server",
+	Flag = "HunterESP",
+	CurrentValue = false,
+})
+HuntersBox:CreateToggle({ Name = "Name", Flag = "HunterName", CurrentValue = true, DependsOn = "HunterESP" })
+HuntersBox:CreateToggle({ Name = "Distance", Flag = "HunterDistance", CurrentValue = true, DependsOn = "HunterESP" })
+HuntersBox:CreateToggle({ Name = "Chams", Flag = "HunterChams", CurrentValue = true, DependsOn = "HunterESP" })
+HuntersBox:CreateToggle({ Name = "Box", Flag = "HunterBox", CurrentValue = true, DependsOn = "HunterESP" })
+HuntersBox:CreateToggle({ Name = "Tracer", Flag = "HunterTracer", CurrentValue = false, DependsOn = "HunterESP" })
+HuntersBox:CreateStatus({
+	Name = "Tracked",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		return string.format("<Success>%d</Success> <Muted>hunters</Muted>", stats.hunters)
+	end,
+})
+
+local StyleTab = Window:CreateTab({ Name = "Style", Icon = "palette" })
+local ColorBox = StyleTab:CreateGroupbox({ Name = "Colors", Side = "Left" })
+local RangeBox = StyleTab:CreateGroupbox({ Name = "Range", Side = "Right" })
+
+ColorBox:CreateColorPicker({ Name = "Animal", Color = COLOR_DEFAULT_ANIMAL, Flag = "AnimalColor" })
+ColorBox:CreateColorPicker({ Name = "Dead", Color = COLOR_DEFAULT_DEAD, Flag = "DeadColor" })
+ColorBox:CreateColorPicker({ Name = "Hunter", Color = COLOR_DEFAULT_PLAYER, Flag = "HunterColor" })
+ColorBox:CreateColorPicker({ Name = "Tracer", Color = COLOR_DEFAULT_TRACER, Flag = "TracerColor" })
+
+RangeBox:CreateSlider({
+	Name = "Render distance",
+	Range = { 100, 3000 },
+	Increment = 100,
+	Suffix = " studs",
+	CurrentValue = 1500,
+	Flag = "RenderDistance",
+})
+RangeBox:CreateDropdown({
+	Name = "Distance from",
+	Options = { "Camera", "Character" },
+	CurrentOption = "Camera",
+	Flag = "DistanceFrom",
+})
+RangeBox:CreateButton({
+	Name = "Clear visuals",
+	Desc = "Remove every box, label and highlight",
+	Callback = function()
+		clearAll()
+		Window:Notify({ Title = "Cleared", Content = "All ESP objects removed", Type = "Info" })
+	end,
+})
+RangeBox:CreateButton({
+	Name = "Unload",
+	Desc = "Close the interface and stop everything",
+	Style = "Primary",
+	Callback = function()
+		local api = getgenv().RobScriptRH
+		if type(api) == "table" and type(api.Destroy) == "function" then
+			api.Destroy()
+		end
+	end,
+})
+
+local SettingsTab = Window:CreateTab({ Name = "Settings", Icon = "settings" })
+SettingsTab:CreateConfigManager({ Name = "Configs", Side = "Left" })
+SettingsTab:CreateThemeManager({ Name = "Theme", Side = "Right" })
+
+----- Runtime -----
+
+resetFlagCache()
+
+local collectAccumulator = 0
+local visualAccumulator = 0
+
+local heartbeat = RunService.Heartbeat:Connect(function(deltaTime)
+	if not running then
+		return
+	end
+	collectAccumulator = collectAccumulator + deltaTime
+	visualAccumulator = visualAccumulator + deltaTime
+
+	if collectAccumulator >= COLLECT_INTERVAL then
+		collectAccumulator = 0
+		pcall(collectAnimals)
+		pcall(collectHunters)
+	end
+
+	if visualAccumulator >= VISUAL_INTERVAL then
+		visualAccumulator = 0
+		pcall(refresh)
+	end
+end)
+
+local inputConnection = UserInputService.InputBegan:Connect(function(input, processed)
+	if processed or not running then
+		return
+	end
+	if input.KeyCode == Enum.KeyCode.End then
+		pcall(function()
+			setFlag("AnimalESP", false)
+			setFlag("HunterESP", false)
+			clearAll()
+		end)
+	end
+end)
+
+----- Teardown -----
+
+local function destroy()
+	if not running then
+		return
+	end
+	running = false
+	pcall(function()
+		heartbeat:Disconnect()
+	end)
+	pcall(function()
+		inputConnection:Disconnect()
+	end)
+	clearAll()
+	pcall(function()
+		Window:Destroy()
+	end)
+	Airflow = nil
+	if getgenv().RobScriptRH then
+		getgenv().RobScriptRH = nil
+	end
+end
+
+----- Public interface -----
+
+getgenv().RobScriptRH = {
+	Version = "1.0",
+	Actions = {
+		Refresh = function()
+			collectAnimals()
+			collectHunters()
+			refresh()
+		end,
+		Clear = clearAll,
+		Destroy = destroy,
+	},
+	GetStats = function()
+		return { tracked = stats.tracked, hunters = stats.hunters, drawn = stats.drawn }
+	end,
+	Get = function(name, fallback)
+		return flag(name, fallback)
+	end,
+	Set = function(name, value)
+		return setFlag(name, value)
+	end,
+	GetTargets = function()
+		local list = {}
+		for _, target in pairs(animalTargets) do
+			list[#list + 1] = {
+				label = target.label,
+				species = target.species,
+				grade = target.grade,
+				dead = target.dead,
+				color = target.baseColor,
+			}
+		end
+		return list
+	end,
+	-- Drawing state straight from the render objects, so a test run can confirm
+	-- the boxes land on screen without anyone having to look at the window.
+	Debug = function()
+		local list = {}
+		for _, target in pairs(animalTargets) do
+			local line = target.box[1]
+			local entry = {
+				label = target.label,
+				box = (line ~= nil and line.Visible) or false,
+				name = (target.nameText ~= nil and target.nameText.Visible) or false,
+				info = (target.infoText ~= nil and target.infoText.Visible) or false,
+				tracer = (target.tracer ~= nil and target.tracer.Visible) or false,
+				chams = (target.highlight ~= nil and target.highlight.Enabled) or false,
+			}
+			if line and line.Visible then
+				entry.rect = string.format("%d,%d %dx%d", math.floor(line.From.X), math.floor(line.From.Y),
+					math.floor(line.To.X - line.From.X), math.floor(math.abs(line.To.Y - line.From.Y)))
+			end
+			list[#list + 1] = entry
+		end
+		return list
+	end,
+	Destroy = destroy,
+}
+
+----- Boot -----
+
+pcall(function()
+	Window:LoadAutoload()
+end)
+
+Window:Notify({ Title = "Robscript Team", Content = "Realistic Hunting ESP is ready", Type = "Success" })
+
+return getgenv().RobScriptRH
