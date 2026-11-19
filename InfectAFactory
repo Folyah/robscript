@@ -1,0 +1,1247 @@
+-- Robscript Team - Infect a Factory Auto Farm
+-- Game: [Underground] Infect a Factory | placeId 88461594756414 | gameId 10774787698
+-- Window: RightControl | Panic: End | API: getgenv().RobScriptIAF
+--
+-- What it does: queues every infectable object in your own yard, teleports to its
+-- prompt and holds it until the server finishes the 4.5s infection, then repeats.
+-- The economy tab reads the live StateSnapshot plus the game's own object catalog
+-- so the window can show goo/s, the next purchase and its ETA.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+
+local LocalPlayer = Players.LocalPlayer
+
+-- Unload a previous copy so its loops, holds and window die first.
+do
+	local existing = getgenv().RobScriptIAF
+	if type(existing) == "table" and type(existing.Destroy) == "function" then
+		pcall(existing.Destroy)
+	end
+end
+
+----- Library -----
+
+local LIBRARY_URLS = {
+	"https://raw.githubusercontent.com/bobloscript/Robly_Airflow/main/Source.luau",
+	"https://raw.githubusercontent.com/PookiePepelsss/Airflow-UI/refs/heads/main/Source.luau",
+}
+
+-- Both mirrors are published, but only one still ships the groupbox and status
+-- elements this interface is built from. Load whatever works and prefer the
+-- build that has ThemePresets, which is the marker for the full layout API.
+local Airflow = nil
+local fallbackLibrary = nil
+for _, url in ipairs(LIBRARY_URLS) do
+	local ok, library = pcall(function()
+		return loadstring(game:HttpGet(url))()
+	end)
+	if ok and type(library) == "table" and type(library.CreateWindow) == "function" then
+		if not fallbackLibrary then
+			fallbackLibrary = library
+		end
+		if type(library.ThemePresets) == "table" then
+			Airflow = library
+			break
+		end
+	end
+end
+
+Airflow = Airflow or fallbackLibrary
+
+if not Airflow then
+	error("[RobScript IAF] Airflow UI could not be loaded")
+end
+
+----- Theme -----
+
+local THEME = {
+	Background = Color3.fromHex("#0A0A0C"),
+	Surface = Color3.fromHex("#141418"),
+	Surface2 = Color3.fromHex("#1A1A20"),
+	Surface3 = Color3.fromHex("#2A2A33"),
+	Stroke = Color3.fromHex("#26262E"),
+	StrokeHover = Color3.fromHex("#3C3C49"),
+	Accent = Color3.fromHex("#FF3B7F"),
+	AccentDark = Color3.fromHex("#1A0710"),
+	Text = Color3.fromHex("#F5F5F7"),
+	Muted = Color3.fromHex("#8D8D99"),
+}
+
+-- Airflow ships two theme APIs: the new AddTheme/SetTheme pair and the older
+-- ThemePresets/SetDefaultTheme pair. Support both so a mirror update cannot
+-- break the window, and always merge over the library defaults so keys such
+-- as Success, Warning, Error and Glow stay valid.
+local ThemeValue = THEME
+do
+	local merged = {}
+	for key, value in pairs(Airflow.Theme or {}) do
+		merged[key] = value
+	end
+	for key, value in pairs(THEME) do
+		merged[key] = value
+	end
+	if type(Airflow.AddTheme) == "function" and type(Airflow.SetTheme) == "function" then
+		local ok = pcall(function()
+			Airflow:AddTheme("Robscript", merged)
+			Airflow:SetTheme("Robscript")
+		end)
+		if ok then
+			ThemeValue = "Robscript"
+		end
+	elseif type(Airflow.ThemePresets) == "table" then
+		Airflow.ThemePresets.Robscript = merged
+		pcall(function()
+			Airflow:SetDefaultTheme("Robscript")
+		end)
+	end
+end
+
+----- Language -----
+
+pcall(function()
+	Airflow:AddLanguage("ru", {
+		Name = "Русский",
+		Flag = "ru",
+		Strings = {
+			["Farm"] = "Фарм",
+			["Economy"] = "Экономика",
+			["Settings"] = "Настройки",
+			["Auto Farm"] = "Авто-фарм",
+			["Priority"] = "Приоритет",
+			["Reserve"] = "Резерв",
+			["Max price"] = "Макс. цена",
+			["Humanize"] = "Человечность",
+			["Overlay"] = "Оверлей",
+			["Chain order"] = "По цепочке",
+			["Cheapest first"] = "Сначала дешёвое",
+			["Best income"] = "Лучший доход",
+			["State"] = "Состояние",
+			["Target"] = "Цель",
+			["Cycles"] = "Циклы",
+			["Goo per second"] = "Goo в секунду",
+			["Next purchase"] = "Следующая покупка",
+			["ETA"] = "Осталось",
+			["Bond"] = "Бонд",
+			["Area progress"] = "Прогресс зоны",
+			["Infect next now"] = "Заразить следующее",
+			["Refresh data"] = "Обновить данные",
+			["Unload"] = "Выгрузить",
+			["Close the interface and stop everything"] = "Закрывает интерфейс и останавливает скрипт",
+			["Idle"] = "Ожидание",
+			["Waiting for goo"] = "Ждём goo",
+			["Infecting"] = "Заражение",
+			["Done"] = "Готово",
+			["Failed"] = "Не вышло",
+			["No yard"] = "Двор не найден",
+			["Robscript Team"] = "Robscript Team",
+			["Infect a Factory Auto Farm is ready"] = "Авто-фарм Infect a Factory готов",
+		},
+	})
+end)
+
+----- Flags -----
+
+local flagCache = {}
+
+local function resetFlagCache()
+	flagCache = {}
+end
+
+local function getFlag(name)
+	local cached = flagCache[name]
+	if cached ~= nil then
+		return cached ~= false and cached or nil
+	end
+	local container = Airflow.Flags
+	local entry = type(container) == "table" and container[name] or nil
+	if type(entry) == "table" then
+		flagCache[name] = entry
+		return entry
+	end
+	flagCache[name] = false
+	return nil
+end
+
+local function flag(name, fallback)
+	local entry = getFlag(name)
+	if not entry then
+		return fallback
+	end
+	local ok, value = pcall(function()
+		return entry:Get()
+	end)
+	if ok and value ~= nil then
+		return value
+	end
+	return fallback
+end
+
+local function setFlag(name, value)
+	local entry = getFlag(name)
+	if not entry then
+		return false
+	end
+	return (pcall(function()
+		entry:Set(value)
+	end))
+end
+
+----- Helpers -----
+
+local SUFFIXES = {
+	{ "T", 1e12 },
+	{ "B", 1e9 },
+	{ "M", 1e6 },
+	{ "K", 1e3 },
+}
+
+local function formatNumber(value)
+	if type(value) ~= "number" or value ~= value then
+		return "0"
+	end
+	for _, pair in ipairs(SUFFIXES) do
+		if math.abs(value) >= pair[2] then
+			return string.format("%.1f%s", value / pair[2], pair[1])
+		end
+	end
+	if math.abs(value) >= 100 then
+		return string.format("%d", math.floor(value + 0.5))
+	end
+	if math.abs(value) >= 10 then
+		return string.format("%.1f", value)
+	end
+	return string.format("%.2f", value)
+end
+
+local function formatDuration(seconds)
+	if type(seconds) ~= "number" or seconds ~= seconds or seconds == math.huge then
+		return "—"
+	end
+	if seconds <= 0 then
+		return "now"
+	end
+	if seconds < 60 then
+		return string.format("%ds", math.ceil(seconds))
+	end
+	if seconds < 3600 then
+		return string.format("%dm %ds", math.floor(seconds / 60), math.floor(seconds % 60))
+	end
+	return string.format("%dh %dm", math.floor(seconds / 3600), math.floor((seconds % 3600) / 60))
+end
+
+-- "58K", "1.2M", "3.4B" -> number. Used for the values the game prints in its own HUD.
+local function parseCompact(text)
+	if type(text) ~= "string" then
+		return nil
+	end
+	local cleaned = text:gsub(",", ""):gsub("%s", "")
+	local number, suffix = cleaned:match("([%d%.]+)([KkMmBbTt]?)")
+	if not number then
+		return nil
+	end
+	local value = tonumber(number)
+	if not value then
+		return nil
+	end
+	if suffix ~= "" then
+		for _, pair in ipairs(SUFFIXES) do
+			if pair[1] == suffix:upper() then
+				value = value * pair[2]
+				break
+			end
+		end
+	end
+	return value
+end
+
+local function addressOf(inst, path)
+	local current = inst
+	for part in string.gmatch(path, "[^%.]+") do
+		if not current then
+			return nil
+		end
+		current = current:FindFirstChild(part)
+	end
+	return current
+end
+
+local function labelText(inst, path)
+	local node = addressOf(inst, path)
+	if node and (node:IsA("TextLabel") or node:IsA("TextButton")) then
+		return node.Text
+	end
+	return nil
+end
+
+----- Object catalog -----
+
+-- The game ships its whole build tree in ReplicatedStorage.Shared.Objects.
+-- Requiring it is read-only and gives cost, drip rate and prerequisites.
+local catalog = {}
+local catalogCount = 0
+
+local function buildCatalog()
+	local shared = ReplicatedStorage:FindFirstChild("Shared")
+	local module = shared and shared:FindFirstChild("Objects")
+	if not module then
+		return 0
+	end
+	local ok, data = pcall(require, module)
+	if not ok or type(data) ~= "table" then
+		return 0
+	end
+	local count = 0
+	for areaName, group in pairs(data) do
+		if type(group) == "table" then
+			for _, entry in pairs(group) do
+				if type(entry) == "table" and type(entry.id) == "string" then
+					local drip = tonumber(entry.dripInterval) or 1
+					local blob = tonumber(entry.blobValue) or 0
+					catalog[entry.id] = {
+						id = entry.id,
+						name = tostring(entry.name or entry.id),
+						cost = tonumber(entry.cost) or 0,
+						role = tostring(entry.role or ""),
+						tier = tonumber(entry.tier) or 0,
+						bond = tonumber(entry.bond) or 0,
+						blobValue = blob,
+						dripInterval = drip,
+						income = blob > 0 and (blob / math.max(drip, 0.05)) or 0,
+						requires = type(entry.requires) == "table" and entry.requires or {},
+						area = tostring(areaName),
+					}
+					count = count + 1
+				end
+			end
+		end
+	end
+	catalogCount = count
+	return count
+end
+
+buildCatalog()
+
+----- Live state -----
+
+local state = {
+	snapshot = nil,
+	snapshotAge = 0,
+	lastAt = 0,
+}
+
+local function remotes()
+	return ReplicatedStorage:FindFirstChild("Remotes")
+end
+
+do
+	local container = remotes()
+	local snapshotRemote = container and container:FindFirstChild("StateSnapshot")
+	if snapshotRemote then
+		snapshotRemote.OnClientEvent:Connect(function(payload)
+			if type(payload) ~= "table" then
+				return
+			end
+			-- Several yards can push snapshots; only the one carrying our own goo is ours.
+			if payload.goo ~= nil and payload.infected ~= nil then
+				state.snapshot = payload
+				state.lastAt = os.clock()
+			end
+		end)
+	end
+end
+
+local function currentGoo()
+	local snapshot = state.snapshot
+	if snapshot and type(snapshot.goo) == "number" then
+		return snapshot.goo
+	end
+	local stats = LocalPlayer:FindFirstChild("leaderstats")
+	local goo = stats and stats:FindFirstChild("Goo")
+	if goo and goo:IsA("IntValue") then
+		return goo.Value
+	end
+	return 0
+end
+
+local function infectedMap()
+	local snapshot = state.snapshot
+	if snapshot and type(snapshot.infected) == "table" then
+		return snapshot.infected
+	end
+	return {}
+end
+
+local function scrubbedMap()
+	local snapshot = state.snapshot
+	if snapshot and type(snapshot.scrubbed) == "table" then
+		return snapshot.scrubbed
+	end
+	return {}
+end
+
+local function nextObjectId()
+	local snapshot = state.snapshot
+	return snapshot and snapshot.nextObjectId or nil
+end
+
+----- Yard -----
+
+local function findMyYard()
+	local world = Workspace:FindFirstChild("MurkWorld")
+	if not world then
+		return nil
+	end
+	local userId = LocalPlayer.UserId
+	for _, yard in ipairs(world:GetChildren()) do
+		if yard:GetAttribute("OwnerUserId") == userId then
+			return yard
+		end
+	end
+	return nil
+end
+
+----- Prompt scan -----
+
+-- Every infectable object of a yard has a holder Part under Yard.Prompts named
+-- after its ObjectId, with one ProximityPrompt. The server enables the prompt
+-- only for objects the build chain has unlocked, so Enabled is our availability
+-- flag and nothing has to be hardcoded.
+local promptList = {}
+local promptScanAt = 0
+
+local function scanPrompts(force)
+	if not force and os.clock() - promptScanAt < 0.5 then
+		return promptList
+	end
+	promptScanAt = os.clock()
+	local yard = findMyYard()
+	local list = {}
+	if not yard then
+		promptList = list
+		return list
+	end
+	local folder = yard:FindFirstChild("Prompts")
+	if not folder then
+		promptList = list
+		return list
+	end
+	local infected = infectedMap()
+	local scrubbed = scrubbedMap()
+	for _, holder in ipairs(folder:GetChildren()) do
+		local prompt = holder:FindFirstChildWhichIsA("ProximityPrompt", true)
+		if prompt and prompt.ActionText == "Infect" then
+			local id = holder.Name
+			local entry = catalog[id]
+			local done = infected[id] == true and scrubbed[id] ~= true
+			list[#list + 1] = {
+				id = id,
+				holder = holder,
+				prompt = prompt,
+				name = entry and entry.name or id,
+				cost = entry and entry.cost or 0,
+				income = entry and entry.income or 0,
+				role = entry and entry.role or "",
+				area = entry and entry.area or "",
+				enabled = prompt.Enabled,
+				infected = done,
+				reinfect = infected[id] == true and scrubbed[id] == true,
+			}
+		end
+	end
+	promptList = list
+	return list
+end
+
+local function yardName()
+	local yard = findMyYard()
+	return yard and yard.Name or nil
+end
+
+----- Economy -----
+
+local economy = {
+	rate = 0,
+	rateSource = "none",
+	measured = 0,
+	modelRate = 0,
+	hudRate = nil,
+	rateSamples = {},
+	hudIncome = nil,
+	bondLabel = nil,
+	bondTarget = nil,
+	areaLabel = nil,
+	areaHave = nil,
+	areaTotal = nil,
+	nextPurchase = nil,
+	eligible = 0,
+	affordable = 0,
+}
+
+local function sampleRate()
+	local snapshot = state.snapshot
+	if not snapshot or type(snapshot.goo) ~= "number" then
+		return
+	end
+	local now = os.clock()
+	local samples = economy.rateSamples
+	samples[#samples + 1] = { t = now, goo = snapshot.goo }
+	while #samples > 40 do
+		table.remove(samples, 1)
+	end
+	-- Use a window of at least 2s so single snapshot jitter cannot fake a rate.
+	local first = samples[1]
+	local last = samples[#samples]
+	if first and last and last.t - first.t >= 2 then
+		local delta = last.goo - first.goo
+		local elapsed = last.t - first.t
+		local instant = delta / elapsed
+		if instant < 0 then
+			instant = 0
+		end
+		economy.measured = economy.measured * 0.6 + instant * 0.4
+	end
+end
+
+local function readHud()
+	local gui = LocalPlayer:FindFirstChild("PlayerGui")
+	local hud = gui and gui:FindFirstChild("HUD")
+	if not hud then
+		return
+	end
+	local income = labelText(hud, "Column.Stack.Income.Value")
+	if income then
+		economy.hudIncome = income
+		-- "+17.3 goo/s" -> 17.3, "+1.2K goo/s" -> 1200
+		economy.hudRate = parseCompact(income:match("%+?([%d%.]+%s*[KMBTkmbt]?)"))
+	end
+	local bond = labelText(hud, "Column.Stack.NextBond.Value")
+	if bond then
+		economy.bondLabel = bond
+		local amount = bond:match("([%d%.]+%s*[KMBTkmbt]?)")
+		economy.bondTarget = parseCompact(amount)
+	end
+	local areas = labelText(hud, "Column.Stack.Areas.Line1")
+	if areas then
+		economy.areaLabel = areas
+		local have, total = areas:match("(%d+)%s*/%s*(%d+)")
+		economy.areaHave = tonumber(have)
+		economy.areaTotal = tonumber(total)
+	end
+end
+
+local function refreshEconomy()
+	readHud()
+	local list = scanPrompts()
+	local goo = currentGoo()
+	local reserve = tonumber(flag("Reserve", 0)) or 0
+	local cap = tonumber(flag("MaxPrice", 0)) or 0
+	local eligible, affordable, best = 0, 0, nil
+	for _, entry in ipairs(list) do
+		if entry.enabled and not entry.infected then
+			eligible = eligible + 1
+			local budget = goo - reserve
+			if entry.cost <= budget and (cap <= 0 or entry.cost <= cap) then
+				affordable = affordable + 1
+				if not best or entry.cost < best.cost then
+					best = { id = entry.id, name = entry.name, cost = entry.cost, income = entry.income }
+				end
+			end
+		end
+	end
+	economy.eligible = eligible
+	economy.affordable = affordable
+	economy.nextPurchase = best
+
+	-- The balance delta lies while the farm is spending, so the game's own HUD
+	-- number wins, then the catalog sum, and only then the measured delta.
+	local modelRate = 0
+	for id in pairs(infectedMap()) do
+		local entry = catalog[id]
+		if entry then
+			modelRate = modelRate + entry.income
+		end
+	end
+	economy.modelRate = modelRate
+
+	if economy.hudRate and economy.hudRate > 0 then
+		economy.rate = economy.hudRate
+		economy.rateSource = "hud"
+	elseif modelRate > 0.01 then
+		economy.rate = modelRate
+		economy.rateSource = "catalog"
+	else
+		economy.rate = economy.measured
+		economy.rateSource = "measured"
+	end
+end
+
+local function purchaseEta()
+	local best = economy.nextPurchase
+	if not best then
+		return nil
+	end
+	local goo = currentGoo()
+	local rate = economy.rate
+	if rate <= 0 then
+		return nil
+	end
+	return math.max(0, (best.cost - goo) / rate)
+end
+
+----- Farm engine -----
+
+local HOLD_TIMEOUT = 9
+local SETTLE_TIME = 0.3
+
+local blacklist = {}
+
+local farm = {
+	running = false,
+	busy = false,
+	cycles = 0,
+	failures = 0,
+	status = "idle",
+	target = nil,
+	lastId = nil,
+	lastError = nil,
+	generation = 0,
+}
+
+local function priorityMode()
+	return flag("Priority", "Chain order")
+end
+
+local function pickTarget(list)
+	local goo = currentGoo()
+	local reserve = tonumber(flag("Reserve", 0)) or 0
+	local cap = tonumber(flag("MaxPrice", 0)) or 0
+	local now = os.clock()
+	local candidates = {}
+	for _, entry in ipairs(list) do
+		local blocked = blacklist[entry.id]
+		if entry.enabled and (not entry.infected or entry.reinfect) and not (blocked and blocked > now) then
+			if entry.cost <= goo - reserve and (cap <= 0 or entry.cost <= cap) then
+				candidates[#candidates + 1] = entry
+			end
+		end
+	end
+	if #candidates == 0 then
+		return nil, "waiting for goo"
+	end
+	local mode = priorityMode()
+	if mode == "Chain order" then
+		local wanted = nextObjectId()
+		if wanted then
+			for _, entry in ipairs(candidates) do
+				if entry.id == wanted then
+					return entry, "chain"
+				end
+			end
+		end
+	elseif mode == "Best income" then
+		table.sort(candidates, function(a, b)
+			if a.income ~= b.income then
+				return a.income > b.income
+			end
+			return a.cost < b.cost
+		end)
+		return candidates[1], "income"
+	end
+	-- "Cheapest first" and the chain fallback both want the cheapest unlock.
+	table.sort(candidates, function(a, b)
+		return a.cost < b.cost
+	end)
+	return candidates[1], "cheapest"
+end
+
+local function infectOnce(entry)
+	local character = LocalPlayer.Character
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	if not root then
+		return false, "no character"
+	end
+	local holder = entry.holder
+	if not holder or not holder.Parent then
+		return false, "prompt gone"
+	end
+	farm.target = entry
+	farm.status = string.format("infecting %s", entry.name)
+	-- The server checks the distance itself, so the hold only counts while the
+	-- character actually stands at the object.
+	root.CFrame = CFrame.new(holder.Position + Vector3.new(0, 3.2, 0))
+	task.wait(SETTLE_TIME)
+	local ok, err = pcall(function()
+		entry.prompt:InputHoldBegin()
+	end)
+	if not ok then
+		farm.lastError = tostring(err)
+		return false, "hold refused"
+	end
+	local started = os.clock()
+	local done = false
+	while os.clock() - started < HOLD_TIMEOUT do
+		task.wait(0.1)
+		if infectedMap()[entry.id] == true then
+			done = true
+			break
+		end
+		if not entry.prompt.Parent then
+			break
+		end
+	end
+	pcall(function()
+		entry.prompt:InputHoldEnd()
+	end)
+	if done then
+		blacklist[entry.id] = nil
+		farm.cycles = farm.cycles + 1
+		farm.lastId = entry.id
+		farm.status = string.format("done: %s", entry.name)
+		return true, "done"
+	end
+	blacklist[entry.id] = os.clock() + 20
+	farm.failures = farm.failures + 1
+	farm.status = string.format("failed: %s", entry.name)
+	return false, "no infection"
+end
+
+local function farmStep()
+	if farm.busy then
+		return false, "busy"
+	end
+	farm.busy = true
+	local ok, reached, reason = pcall(function()
+		local entry, why = pickTarget(scanPrompts(true))
+		if not entry then
+			return false, why
+		end
+		return infectOnce(entry)
+	end)
+	farm.busy = false
+	if not ok then
+		farm.lastError = tostring(reached)
+		farm.status = "error"
+		return false, farm.lastError
+	end
+	return reached, reason
+end
+
+local function startFarm()
+	if farm.running then
+		return
+	end
+	farm.running = true
+	farm.generation = farm.generation + 1
+	local generation = farm.generation
+	task.spawn(function()
+		while farm.running and generation == farm.generation do
+			if not flag("AutoFarm", false) then
+				farm.status = "idle"
+				task.wait(0.3)
+			elseif not findMyYard() then
+				farm.status = "no yard"
+				task.wait(0.5)
+			else
+				local reached, reason = farmStep()
+				if reached then
+					if flag("Humanize", true) then
+						task.wait(math.random(80, 320) / 1000)
+					else
+						task.wait(0.1)
+					end
+				elseif reason == "waiting for goo" then
+					farm.status = string.format("waiting for goo (%s)", formatNumber(currentGoo()))
+					task.wait(0.5)
+				else
+					task.wait(0.4)
+				end
+			end
+		end
+	end)
+end
+
+local function stopFarm()
+	farm.running = false
+	farm.generation = farm.generation + 1
+	farm.status = "idle"
+	farm.target = nil
+end
+
+----- Overlay -----
+
+local overlayGui = nil
+local overlayLabels = {}
+
+local function buildOverlay()
+	if overlayGui then
+		return
+	end
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "RobScriptIAFFarmHud"
+	gui.ResetOnSpawn = false
+	gui.IgnoreGuiInset = true
+	gui.DisplayOrder = 50
+	gui.Parent = LocalPlayer:FindFirstChild("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui")
+
+	local frame = Instance.new("Frame")
+	frame.Name = "Card"
+	frame.AnchorPoint = Vector2.new(0, 1)
+	frame.Position = UDim2.new(0, 16, 1, -16)
+	frame.Size = UDim2.fromOffset(248, 132)
+	frame.BackgroundColor3 = THEME.Surface
+	frame.BackgroundTransparency = 0.08
+	frame.BorderSizePixel = 0
+	frame.Parent = gui
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 10)
+	corner.Parent = frame
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = THEME.Stroke
+	stroke.Thickness = 1
+	stroke.Parent = frame
+
+	local accent = Instance.new("Frame")
+	accent.Name = "Accent"
+	accent.Size = UDim2.new(1, 0, 0, 2)
+	accent.BackgroundColor3 = THEME.Accent
+	accent.BorderSizePixel = 0
+	accent.Parent = frame
+
+	local title = Instance.new("TextLabel")
+	title.Name = "Title"
+	title.BackgroundTransparency = 1
+	title.Position = UDim2.fromOffset(12, 10)
+	title.Size = UDim2.new(1, -24, 0, 16)
+	title.Font = Enum.Font.GothamBold
+	title.TextSize = 12
+	title.TextXAlignment = Enum.TextXAlignment.Left
+	title.TextColor3 = THEME.Text
+	title.Text = "AUTO FARM"
+	title.Parent = frame
+
+	local rows = { "Status", "Goo", "Rate", "Next", "Eta", "Cycles" }
+	local offset = 30
+	for _, name in ipairs(rows) do
+		local label = Instance.new("TextLabel")
+		label.Name = name
+		label.BackgroundTransparency = 1
+		label.Position = UDim2.fromOffset(12, offset)
+		label.Size = UDim2.new(1, -24, 0, 15)
+		label.Font = Enum.Font.Gotham
+		label.TextSize = 11
+		label.TextXAlignment = Enum.TextXAlignment.Left
+		label.TextColor3 = THEME.Muted
+		label.Text = name
+		label.Parent = frame
+		overlayLabels[name] = label
+		offset = offset + 16
+	end
+
+	overlayGui = gui
+end
+
+local function refreshOverlay()
+	if not flag("Overlay", true) then
+		if overlayGui then
+			overlayGui.Enabled = false
+		end
+		return
+	end
+	buildOverlay()
+	if overlayGui then
+		overlayGui.Enabled = true
+	end
+	local goo = currentGoo()
+	overlayLabels.Status.Text = string.format("status: %s", farm.status)
+	overlayLabels.Goo.Text = string.format("goo: %s x%.2f", formatNumber(goo), tonumber(state.snapshot and state.snapshot.shop and state.snapshot.shop.factor) or 1)
+	overlayLabels.Rate.Text = string.format("rate: +%s/s", formatNumber(economy.rate))
+	local best = economy.nextPurchase
+	overlayLabels.Next.Text = best and string.format("next: %s (%s)", best.name, formatNumber(best.cost)) or "next: waiting"
+	overlayLabels.Eta.Text = string.format("eta: %s", formatDuration(purchaseEta()))
+	overlayLabels.Cycles.Text = string.format("cycles: %d / fails %d", farm.cycles, farm.failures)
+end
+
+local function destroyOverlay()
+	if overlayGui then
+		pcall(function()
+			overlayGui:Destroy()
+		end)
+		overlayGui = nil
+		overlayLabels = {}
+	end
+end
+
+----- Interface -----
+
+local Window = Airflow:CreateWindow({
+	Name = "Robscript Team",
+	LoadingSubtitle = "infect a factory - auto farm",
+	ToggleUIKeybind = "RightControl",
+	Size = UDim2.fromOffset(780, 540),
+	Theme = ThemeValue,
+	Density = "Compact",
+	Backdrop = { Weather = "Fireflies", Tint = 0.35 },
+	ConfigurationSaving = { Enabled = true, FolderName = "RobScriptIAF" },
+	Home = {
+		Title = "Robscript Team",
+		Welcome = "Welcome back,",
+		Tier = "AUTO FARM 1.0",
+		Stats = { "Players", "Session", "FPS", "Ping", "Game", "Executor" },
+	},
+})
+
+local FarmTab = Window:CreateTab({ Name = "Farm", Icon = "play" })
+local FarmBox = FarmTab:CreateGroupbox({ Name = "Auto Farm", Side = "Left" })
+local EconomyBox = FarmTab:CreateGroupbox({ Name = "Economy", Side = "Right" })
+
+FarmBox:CreateToggle({
+	Name = "Auto Farm",
+	Desc = "Infect every unlocked object in your yard",
+	Flag = "AutoFarm",
+	CurrentValue = false,
+})
+FarmBox:CreateDropdown({
+	Name = "Priority",
+	Desc = "How the next object is chosen",
+	Options = { "Chain order", "Cheapest first", "Best income" },
+	CurrentOption = "Chain order",
+	Flag = "Priority",
+	DependsOn = "AutoFarm",
+})
+FarmBox:CreateSlider({
+	Name = "Reserve",
+	Desc = "Keep this much goo unspent",
+	Range = { 0, 50000 },
+	Increment = 500,
+	Suffix = " goo",
+	CurrentValue = 0,
+	Flag = "Reserve",
+	DependsOn = "AutoFarm",
+})
+FarmBox:CreateSlider({
+	Name = "Max price",
+	Desc = "Skip objects above this price, 0 disables it",
+	Range = { 0, 2000000 },
+	Increment = 10000,
+	Suffix = " goo",
+	CurrentValue = 0,
+	Flag = "MaxPrice",
+	DependsOn = "AutoFarm",
+})
+FarmBox:CreateToggle({
+	Name = "Humanize",
+	Desc = "Small random pause between objects",
+	Flag = "Humanize",
+	CurrentValue = true,
+	DependsOn = "AutoFarm",
+})
+FarmBox:CreateDivider()
+FarmBox:CreateToggle({
+	Name = "Overlay",
+	Desc = "Small live card in the corner of the screen",
+	Flag = "Overlay",
+	CurrentValue = true,
+})
+FarmBox:CreateStatus({
+	Name = "Target",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		local target = farm.target
+		if not target then
+			return string.format("<Muted>%s</Muted>", farm.status)
+		end
+		return string.format("<Success>%s</Success> <Muted>%s goo</Muted>", target.name, formatNumber(target.cost))
+	end,
+})
+FarmBox:CreateStatus({
+	Name = "Cycles",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		return string.format("<Success>%d</Success> <Muted>ok</Muted>  <Warning>%d</Warning> <Muted>failed</Muted>", farm.cycles, farm.failures)
+	end,
+})
+
+EconomyBox:CreateStatus({
+	Name = "Goo",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		return string.format("<Success>%s</Success>", formatNumber(currentGoo()))
+	end,
+})
+EconomyBox:CreateStatus({
+	Name = "Goo per second",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		local suffix = economy.hudIncome and string.format(" <Muted>(%s)</Muted>", economy.hudIncome) or ""
+		return string.format("<Success>+%s</Success>%s", formatNumber(economy.rate), suffix)
+	end,
+})
+EconomyBox:CreateStatus({
+	Name = "Next purchase",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		local best = economy.nextPurchase
+		if not best then
+			return string.format("<Muted>waiting for goo</Muted>")
+		end
+		return string.format("<Success>%s</Success> <Muted>%s goo</Muted>", best.name, formatNumber(best.cost))
+	end,
+})
+EconomyBox:CreateStatus({
+	Name = "ETA",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		local eta = purchaseEta()
+		if not eta then
+			return "<Muted>—</Muted>"
+		end
+		return string.format("<Success>%s</Success>", formatDuration(eta))
+	end,
+})
+EconomyBox:CreateStatus({
+	Name = "Bond",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		return string.format("<Muted>%s</Muted>", economy.bondLabel or "—")
+	end,
+})
+EconomyBox:CreateStatus({
+	Name = "Area progress",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		return string.format("<Muted>%s</Muted>", economy.areaLabel or "—")
+	end,
+})
+EconomyBox:CreateDivider()
+EconomyBox:CreateButton({
+	Name = "Infect next now",
+	Desc = "Run a single farm cycle by hand",
+	Callback = function()
+		task.spawn(function()
+			local reached, reason = farmStep()
+			Window:Notify({
+				Title = reached and "Done" or "Skipped",
+				Content = reached and string.format("Infected %s", farm.lastId or "object") or tostring(reason),
+				Type = reached and "Success" or "Warning",
+			})
+		end)
+	end,
+})
+EconomyBox:CreateButton({
+	Name = "Refresh data",
+	Desc = "Re-read the object catalog and the live state",
+	Callback = function()
+		buildCatalog()
+		resetFlagCache()
+		refreshEconomy()
+		Window:Notify({
+			Title = "Refreshed",
+			Content = string.format("%d objects in catalog", catalogCount),
+			Type = "Info",
+		})
+	end,
+})
+
+local SettingsTab = Window:CreateTab({ Name = "Settings", Icon = "settings" })
+SettingsTab:CreateConfigManager({ Name = "Configs", Side = "Left" })
+SettingsTab:CreateThemeManager({ Name = "Theme", Side = "Right" })
+SettingsTab:CreateButton({
+	Name = "Unload",
+	Desc = "Close the interface and stop everything",
+	Style = "Primary",
+	Callback = function()
+		local api = getgenv().RobScriptIAF
+		if type(api) == "table" and type(api.Destroy) == "function" then
+			api.Destroy()
+		end
+	end,
+})
+
+----- Runtime -----
+
+resetFlagCache()
+
+local running = true
+local heartbeatConnection = nil
+local inputConnection = nil
+
+startFarm()
+
+task.spawn(function()
+	while running do
+		pcall(sampleRate)
+		pcall(refreshEconomy)
+		pcall(refreshOverlay)
+		task.wait(0.25)
+	end
+end)
+
+inputConnection = UserInputService.InputBegan:Connect(function(input, processed)
+	if processed or not running then
+		return
+	end
+	if input.KeyCode == Enum.KeyCode.End then
+		pcall(function()
+			setFlag("AutoFarm", false)
+			stopFarm()
+			if overlayGui then
+				overlayGui.Enabled = false
+			end
+			Window:Notify({ Title = "Stopped", Content = "Auto farm is off", Type = "Info" })
+		end)
+	end
+end)
+
+----- Teardown -----
+
+local function destroy()
+	if not running then
+		return
+	end
+	running = false
+	stopFarm()
+	if heartbeatConnection then
+		pcall(function()
+			heartbeatConnection:Disconnect()
+		end)
+	end
+	if inputConnection then
+		pcall(function()
+			inputConnection:Disconnect()
+		end)
+	end
+	destroyOverlay()
+	pcall(function()
+		Window:Destroy()
+	end)
+	Airflow = nil
+	if getgenv().RobScriptIAF then
+		getgenv().RobScriptIAF = nil
+	end
+end
+
+----- Public interface -----
+
+getgenv().RobScriptIAF = {
+	Version = "1.0",
+	Actions = {
+		Start = function()
+			setFlag("AutoFarm", true)
+		end,
+		Stop = function()
+			setFlag("AutoFarm", false)
+			stopFarm()
+		end,
+		InfectNext = function()
+			return farmStep()
+		end,
+		Refresh = function()
+			buildCatalog()
+			refreshEconomy()
+			refreshOverlay()
+		end,
+		Destroy = destroy,
+	},
+	GetStats = function()
+		return {
+			goo = currentGoo(),
+			rate = economy.rate,
+			cycles = farm.cycles,
+			failures = farm.failures,
+			eligible = economy.eligible,
+			affordable = economy.affordable,
+			status = farm.status,
+			target = farm.target and farm.target.id or nil,
+		}
+	end,
+	GetState = function()
+		local snapshot = state.snapshot or {}
+		return {
+			goo = snapshot.goo,
+			bonds = snapshot.bonds,
+			nextObjectId = snapshot.nextObjectId,
+			infected = snapshot.infected,
+			scrubbed = snapshot.scrubbed,
+			shop = snapshot.shop,
+			yard = yardName(),
+		}
+	end,
+	GetTargets = function()
+		local list = {}
+		for _, entry in ipairs(scanPrompts(true)) do
+			list[#list + 1] = {
+				id = entry.id,
+				name = entry.name,
+				cost = entry.cost,
+				income = entry.income,
+				area = entry.area,
+				enabled = entry.enabled,
+				infected = entry.infected,
+			}
+		end
+		return list
+	end,
+	GetCatalog = function()
+		return catalog
+	end,
+	Get = function(name, fallback)
+		return flag(name, fallback)
+	end,
+	Set = function(name, value)
+		return setFlag(name, value)
+	end,
+	-- Everything a test run needs without anyone looking at the screen.
+	Debug = function()
+		return {
+			loaded = running,
+			yard = yardName(),
+			catalog = catalogCount,
+			snapshotAge = state.snapshot and (os.clock() - state.lastAt) or nil,
+			goo = currentGoo(),
+			rate = economy.rate,
+			rateSource = economy.rateSource,
+			hudRate = economy.hudRate,
+			modelRate = economy.modelRate,
+			measuredRate = economy.measured,
+			eligible = economy.eligible,
+			affordable = economy.affordable,
+			target = farm.target and farm.target.id or nil,
+			status = farm.status,
+			cycles = farm.cycles,
+			failures = farm.failures,
+			lastError = farm.lastError,
+			farmFlag = flag("AutoFarm", false),
+			overlay = overlayGui ~= nil and overlayGui.Enabled or false,
+			bondLabel = economy.bondLabel,
+			areaLabel = economy.areaLabel,
+			hudIncome = economy.hudIncome,
+		}
+	end,
+	Destroy = destroy,
+}
+
+----- Boot -----
+
+pcall(function()
+	Window:LoadAutoload()
+end)
+
+pcall(function()
+	Window:Notify({ Title = "Robscript Team", Content = "Infect a Factory Auto Farm is ready", Type = "Success" })
+end)
+
+return getgenv().RobScriptIAF
