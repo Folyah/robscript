@@ -1,0 +1,1030 @@
+-- Robscript Team - BloxNG Crash Farm
+-- Game: BloxNG [CRASH PHYSICS] | placeId 83784149502814 | developer Deform Dynamics
+-- Window: RightControl | Panic: End | API: getgenv().RobScriptBNG
+--
+-- What it does: puts your car back on the recorded run-up spot, launches it into the
+-- pit wall so the server pays out for the damage, parks it on the same spot again and
+-- sends the game's own "repair" car command. Then the loop repeats.
+--
+-- The payout is computed by the server from real crash damage, so the loop always
+-- produces a physical collision instead of faking numbers.
+--
+-- The Car Mods tab is an optional handling assist (speed boost, speed limit, turn
+-- speed) that only acts while you hold the throttle or steer yourself.
+
+do
+	local existing = getgenv().RobScriptBNG
+	if type(existing) == "table" and type(existing.Destroy) == "function" then
+		pcall(existing.Destroy)
+	end
+end
+
+----- Services -----
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+
+local LocalPlayer = Players.LocalPlayer
+
+local VERSION = "1.2"
+
+----- Library -----
+
+local LIBRARY_URLS = {
+	"https://raw.githubusercontent.com/bobloscript/Robly_Airflow/main/Source.luau",
+	"https://raw.githubusercontent.com/PookiePepelsss/Airflow-UI/refs/heads/main/Source.luau",
+}
+
+local Airflow = nil
+local fallbackLibrary = nil
+for _, url in ipairs(LIBRARY_URLS) do
+	local ok, library = pcall(function()
+		return loadstring(game:HttpGet(url))()
+	end)
+	if ok and type(library) == "table" and type(library.CreateWindow) == "function" then
+		if not fallbackLibrary then
+			fallbackLibrary = library
+		end
+		if type(library.ThemePresets) == "table" then
+			Airflow = library
+			break
+		end
+	end
+end
+
+Airflow = Airflow or fallbackLibrary
+
+if not Airflow then
+	error("[RobScript BNG] Airflow UI could not be loaded")
+end
+
+----- Theme -----
+
+local THEME = {
+	Background = Color3.fromHex("#0A0A0C"),
+	Surface = Color3.fromHex("#141418"),
+	Surface2 = Color3.fromHex("#1A1A20"),
+	Surface3 = Color3.fromHex("#2A2A33"),
+	Stroke = Color3.fromHex("#26262E"),
+	StrokeHover = Color3.fromHex("#3C3C49"),
+	Accent = Color3.fromHex("#FF3B7F"),
+	AccentDark = Color3.fromHex("#1A0710"),
+	Text = Color3.fromHex("#F5F5F7"),
+	Muted = Color3.fromHex("#8D8D99"),
+}
+
+Airflow.ThemePresets.Robscript = THEME
+Airflow:SetDefaultTheme(THEME)
+
+----- Game data -----
+
+local CARS_FOLDER = "CrashTest"
+
+-- The run-up spot the owner recorded in the pit: standing room, then a straight line
+-- into the nearest pit wall.
+local DEFAULT_SPOT = Vector3.new(6367.59, -197.01, 701.90)
+local DEFAULT_DIRECTION = Vector3.new(-0.5658, 0, -0.8245).Unit
+
+local CONFIG = {
+	DefaultSpeed = 170,
+	MinSpeed = 60,
+	MaxSpeed = 450,
+	DefaultSettle = 1.2,
+	DefaultRepairTimeout = 20,
+	DefaultReEnter = true,
+	CrashDamage = 0.05,
+	LaunchHold = 0.5,
+	WallClock = 5,
+	PayoutWindow = 2,
+}
+
+----- Language -----
+
+Airflow:AddLanguage("ru", {
+	Name = "Русский",
+	Flag = "ru",
+	Strings = {
+		["crash farm, repairs, stats"] = "фарм крашей, ремонт, статистика",
+		["Logs"] = "Логи",
+		["Farm"] = "Фарм",
+		["Settings"] = "Настройки",
+		["Automation"] = "Автоматизация",
+		["Auto farm"] = "Автофарм",
+		["Repeats the launch, crash and repair cycle"] = "Повторяет цикл разгона, краша и ремонта",
+		["Run one crash"] = "Один краш",
+		["Single cycle for testing"] = "Один цикл для проверки",
+		["Impact speed"] = "Скорость удара",
+		["Settle delay"] = "Пауза после удара",
+		["Repair timeout"] = "Таймаут ремонта",
+		["Re-enter car"] = "Садиться в машину",
+		["Sits back into the driver seat when you get thrown out"] = "Снова садится за руль, если вас выбросило",
+		["Spot"] = "Точка",
+		["Coordinates"] = "Координаты",
+		["Capture spot from car"] = "Взять точку с машины",
+		["Reset spot to default"] = "Вернуть точку по умолчанию",
+		["Status"] = "Статус",
+		["State"] = "Состояние",
+		["Idle"] = "Ожидание",
+		["Crashes"] = "Краши",
+		["Earned"] = "Заработано",
+		["Per minute"] = "В минуту",
+		["Balance"] = "Баланс",
+		["Session"] = "Сессия",
+		["Activity"] = "Активность",
+		["Nothing yet"] = "Пока пусто",
+		["Reset counters"] = "Сбросить счётчики",
+		["Stop farm"] = "Остановить фарм",
+		["Unload"] = "Выгрузить",
+		["Loaded"] = "Загружено",
+		["BloxNG Crash Farm is ready"] = "BloxNG Crash Farm готов",
+		["Configs"] = "Конфиги",
+		["Car Mods"] = "Тюнинг машины",
+		["Handling"] = "Управление",
+		["Speed & Handling"] = "Скорость и управление",
+		["Boosts acceleration and cornering grip"] = "Усиливает разгон и сцепление в поворотах",
+		["Speed Boost"] = "Прибавка скорости",
+		["Extra push while the throttle is held"] = "Дополнительный разгон при нажатом газе",
+		["Max Speed"] = "Максимальная скорость",
+		["The boost stops here"] = "Выше прибавка не работает",
+		["Turn Speed"] = "Скорость поворота",
+		["How hard the car rotates into a corner"] = "Насколько резко машина заходит в поворот",
+		["Car mods"] = "Тюнинг",
+		["Off"] = "Выкл",
+		["Active"] = "Активно",
+		["No driver seat"] = "Нет водительского места",
+		["How it works"] = "Как это работает",
+		["The assist adds velocity on top of the game's own physics while you hold "
+			.. "the throttle or steer. It does nothing while the crash farm drives the car."] = "Помощь добавляет скорость поверх физики игры, пока вы сами держите газ или поворачиваете. Во время работы автофарма она ничего не делает.",
+		["Theme"] = "Тема",
+		["Danger"] = "Опасность",
+		["Built for "] = "Собрано для ",
+	},
+})
+
+----- Window -----
+
+local Window = Airflow:CreateWindow({
+	Name = "BloxNG Crash Farm",
+	LoadingSubtitle = "crash farm, repairs, stats",
+	ToggleUIKeybind = "RightControl",
+	Size = UDim2.fromOffset(780, 540),
+	Backdrop = { Weather = "None", Tint = 0.35 },
+	Theme = THEME,
+	ConfigurationSaving = { Enabled = true, FolderName = "RobScriptBNG" },
+	Home = {
+		Title = "BloxNG Crash Farm",
+		Welcome = "Welcome back,",
+		Tier = VERSION,
+		Stats = { "Players", "Session", "FPS", "Ping", "Game", "Executor" },
+	},
+})
+
+----- State -----
+
+local State = {
+	running = false,
+	phase = "Idle",
+	spot = DEFAULT_SPOT,
+	direction = DEFAULT_DIRECTION,
+	crashes = 0,
+	earned = 0,
+	lastGain = 0,
+	sessionStart = os.clock(),
+	sessionStartMoney = 0,
+}
+
+----- UI -----
+
+local Log
+
+local FarmTab = Window:CreateTab({ Name = "Farm", Icon = "zap" })
+local ControlBox = FarmTab:CreateGroupbox({ Name = "Automation", Side = "Left" })
+local SpotBox = FarmTab:CreateGroupbox({ Name = "Spot", Side = "Right" })
+local StatusBox = FarmTab:CreateGroupbox({ Name = "Status", Side = "Right" })
+
+-- Created before the other tabs so it sits right under Farm in the tab strip.
+local ModsTab = Window:CreateTab({ Name = "Car Mods", Icon = "car" })
+
+local LogsTab = Window:CreateTab({ Name = "Logs", Icon = "scroll-text" })
+local LogBox = LogsTab:CreateGroupbox({ Name = "Activity", Side = "Left" })
+Log = LogBox:CreateLog({
+	Name = "Activity",
+	MaxEntries = 300,
+	MaxRows = 16,
+	Timestamps = true,
+	EmptyText = "Nothing yet",
+})
+
+local SettingsTab = Window:CreateTab({ Name = "Settings", Icon = "settings" })
+local SettingsBox = SettingsTab:CreateGroupbox({ Name = "Settings", Side = "Left" })
+
+----- Helpers -----
+
+local function formatNumber(value)
+	local text = tostring(math.floor(math.abs(value) + 0.5))
+	local k
+	repeat
+		text, k = string.gsub(text, "^(-?%d+)(%d%d%d)", "%1,%2")
+	until k == 0
+	if value < 0 then
+		text = "-" .. text
+	end
+	return text
+end
+
+local function setPhase(text)
+	State.phase = text
+end
+
+local function getCarsFolder()
+	local crashTest = Workspace:FindFirstChild(CARS_FOLDER)
+	return crashTest and crashTest:FindFirstChild("Cars") or nil
+end
+
+local function getCar()
+	local folder = getCarsFolder()
+	if not folder then
+		return nil
+	end
+	for _, model in ipairs(folder:GetChildren()) do
+		if model:IsA("Model") and string.find(model.Name, LocalPlayer.Name, 1, true) then
+			return model
+		end
+	end
+	return nil
+end
+
+local function getCarCommand()
+	local node = ReplicatedStorage:FindFirstChild("SoftBody")
+	node = node and node:FindFirstChild("Remotes")
+	node = node and node:FindFirstChild("CarCommand")
+	if node and node:IsA("RemoteEvent") then
+		return node
+	end
+	return nil
+end
+
+local function getMoney()
+	local value = LocalPlayer:GetAttribute("Money")
+	return typeof(value) == "number" and value or 0
+end
+
+-- The crash payout is paid out of a per minute budget and trickles in after the
+-- impact, so the honest session figure is the balance delta, not the sum of the
+-- per cycle gains.
+local function sessionEarned()
+	return getMoney() - (State.sessionStartMoney or getMoney())
+end
+
+local function getHumanoid()
+	local character = LocalPlayer.Character
+	return character and character:FindFirstChildOfClass("Humanoid") or nil
+end
+
+local function getRoot()
+	local character = LocalPlayer.Character
+	return character and character:FindFirstChild("HumanoidRootPart") or nil
+end
+
+local function isSeated(car)
+	local humanoid = getHumanoid()
+	if not (humanoid and humanoid.SeatPart) then
+		return false
+	end
+	local seat = car and car:FindFirstChild("DriverSeat", true)
+	return seat ~= nil and humanoid.SeatPart == seat
+end
+
+local function seatIn(car)
+	local humanoid, root = getHumanoid(), getRoot()
+	if not (humanoid and root) then
+		return false
+	end
+	local seat = car:FindFirstChild("DriverSeat", true)
+	if not seat then
+		return false
+	end
+	root.CFrame = seat.CFrame + Vector3.new(0, 2.5, 0)
+	task.wait(0.12)
+	pcall(function()
+		seat:Sit(humanoid)
+	end)
+	task.wait(0.3)
+	if humanoid.SeatPart ~= seat then
+		pcall(function()
+			humanoid.Sit = true
+		end)
+		task.wait(0.25)
+	end
+	return humanoid.SeatPart == seat
+end
+
+local function setVelocity(car, velocity)
+	return pcall(function()
+		for _, part in ipairs(car:GetDescendants()) do
+			if part:IsA("BasePart") then
+				part.AssemblyLinearVelocity = velocity
+				part.AssemblyAngularVelocity = Vector3.zero
+			end
+		end
+	end)
+end
+
+local function waitUntil(predicate, timeout, interval)
+	local deadline = os.clock() + (timeout or CONFIG.WallClock)
+	interval = interval or 0.1
+	while os.clock() < deadline do
+		if State.__stopped then
+			return false
+		end
+		local ok, result = pcall(predicate)
+		if ok and result then
+			return true
+		end
+		task.wait(interval)
+	end
+	local ok, result = pcall(predicate)
+	return ok and result or false
+end
+
+local function isRepaired(car)
+	if not car then
+		return false
+	end
+	local damage = car:GetAttribute("Damage") or 0
+	local engine = car:GetAttribute("EngineHealth") or 1
+	return damage < 0.02 and engine > 0.99
+end
+
+local function waitRepaired(timeout)
+	return waitUntil(function()
+		return isRepaired(getCar())
+	end, timeout, 0.15)
+end
+
+local function launch(car, speed)
+	local velocity = State.direction * speed
+	local deadline = os.clock() + CONFIG.LaunchHold
+	while os.clock() < deadline do
+		setVelocity(car, velocity)
+		task.wait(0.05)
+	end
+end
+
+local function parkCar(car)
+	pcall(function()
+		car:PivotTo(CFrame.lookAt(State.spot, State.spot + State.direction))
+	end)
+	setVelocity(car, Vector3.zero)
+end
+
+local function repairCar()
+	local remote = getCarCommand()
+	if not remote then
+		return false
+	end
+	local ok = pcall(function()
+		remote:FireServer("repair")
+	end)
+	return ok
+end
+
+----- Car mods -----
+
+-- Handling assist that runs on top of the game's own car physics. It only touches
+-- the seat while the player is actually on the throttle or steering, so the crash
+-- farm below is never disturbed by it.
+local MODS = {
+	Enabled = false,
+	SpeedBoost = 60,
+	MaxSpeedLimit = 400,
+	TurnAssist = 40,
+	Downforce = 50,
+}
+
+local function getVehicleSeat()
+	local humanoid = getHumanoid()
+	if humanoid and humanoid.SeatPart and humanoid.SeatPart:IsA("VehicleSeat") then
+		return humanoid.SeatPart
+	end
+	local folder = getCarsFolder()
+	if folder then
+		for _, model in ipairs(folder:GetChildren()) do
+			if model:IsA("Model") and string.find(model.Name, LocalPlayer.Name, 1, true) then
+				local seat = model:FindFirstChild("DriverSeat", true)
+				if seat and seat:IsA("VehicleSeat") then
+					return seat
+				end
+			end
+		end
+	end
+	return nil
+end
+
+local modsConnection = RunService.Heartbeat:Connect(function(dt)
+	if not MODS.Enabled then
+		return
+	end
+
+	local seat = getVehicleSeat()
+	if not seat then
+		return
+	end
+
+	local throttle = seat.ThrottleFloat
+	local steer = seat.SteerFloat
+	local velocity = seat.AssemblyLinearVelocity
+	local speed = velocity.Magnitude
+
+	if MODS.SpeedBoost > 0 and math.abs(throttle) > 0.05 then
+		if speed < MODS.MaxSpeedLimit then
+			local forward = seat.CFrame.LookVector * throttle
+			local boost = forward * (MODS.SpeedBoost * dt * 2.2)
+			local down = Vector3.new(0, -MODS.Downforce * dt * 0.5, 0)
+			seat.AssemblyLinearVelocity = velocity + boost + down
+		end
+	end
+
+	if MODS.TurnAssist > 0 and math.abs(steer) > 0.05 and speed > 10 then
+		local speedScale = math.clamp(speed / 80, 0.7, 2.5)
+		local targetYaw = -steer * (MODS.TurnAssist * 0.04) * speedScale
+		local angular = seat.AssemblyAngularVelocity
+		seat.AssemblyAngularVelocity = angular:Lerp(Vector3.new(angular.X, targetYaw, angular.Z), 0.35)
+
+		local direction = seat.CFrame.LookVector * (throttle >= 0 and 1 or -1)
+		local flatVelocity = Vector3.new(velocity.X, 0, velocity.Z)
+		local aligned = flatVelocity:Lerp(direction * flatVelocity.Magnitude, 0.12)
+		seat.AssemblyLinearVelocity = Vector3.new(aligned.X, velocity.Y, aligned.Z)
+	end
+end)
+
+----- Farm cycle -----
+
+local function readOptions()
+	local speed = CONFIG.DefaultSpeed
+	local settle = CONFIG.DefaultSettle
+	local repairTimeout = CONFIG.DefaultRepairTimeout
+	local reEnter = CONFIG.DefaultReEnter
+
+	if Airflow.Flags.ImpactSpeed then
+		speed = Airflow.Flags.ImpactSpeed:Get() or speed
+	end
+	if Airflow.Flags.SettleDelay then
+		settle = Airflow.Flags.SettleDelay:Get() or settle
+	end
+	if Airflow.Flags.RepairTimeout then
+		repairTimeout = Airflow.Flags.RepairTimeout:Get() or repairTimeout
+	end
+	if Airflow.Flags.ReEnterCar then
+		reEnter = Airflow.Flags.ReEnterCar:Get()
+	end
+
+	return {
+		speed = speed,
+		settle = settle,
+		repairTimeout = repairTimeout,
+		reEnter = reEnter ~= false,
+	}
+end
+
+local function runCrashCycle()
+	local options = readOptions()
+
+	local car = getCar()
+	if not car then
+		return false, "Your car is not in the world"
+	end
+
+	if not isSeated(car) and options.reEnter then
+		setPhase("Entering the car")
+		if not seatIn(car) then
+			return false, "Could not sit in the driver seat"
+		end
+		car = getCar() or car
+	end
+	if not isSeated(car) then
+		return false, "You are not in the driver seat"
+	end
+
+	if not isRepaired(car) then
+		setPhase("Repairing the car")
+		if not repairCar() then
+			return false, "The repair command remote was not found"
+		end
+		if not waitRepaired(options.repairTimeout) then
+			return false, "The car did not finish repairing"
+		end
+	else
+		setPhase("Waiting for the car")
+	end
+
+	car = getCar() or car
+	local moneyBefore = getMoney()
+
+	setPhase("Launching")
+	parkCar(car)
+	task.wait(0.3)
+	launch(car, options.speed)
+
+	setPhase("Crashing")
+	local crashed = waitUntil(function()
+		local current = getCar()
+		return current ~= nil and (current:GetAttribute("Damage") or 0) >= CONFIG.CrashDamage
+	end, CONFIG.WallClock, 0.05)
+
+	-- The payout comes out of a per minute budget and can land a moment after the
+	-- impact, so wait for the balance to move before the gain is read.
+	waitUntil(function()
+		return getMoney() > moneyBefore
+	end, CONFIG.PayoutWindow, 0.1)
+	task.wait(options.settle)
+
+	local gain = getMoney() - moneyBefore
+	State.crashes = State.crashes + 1
+	State.earned = State.earned + gain
+	State.lastGain = gain
+
+	setPhase("Repairing")
+	local parkingCar = getCar() or car
+	parkCar(parkingCar)
+	task.wait(0.1)
+
+	if not repairCar() then
+		return false, "The repair command remote was not found"
+	end
+
+	if not waitRepaired(options.repairTimeout) then
+		return false, "The car did not come back after the repair"
+	end
+
+	if not crashed then
+		return false, "The launch did not damage the car"
+	end
+
+	Log:Push(string.format(
+		"<Success>Crash %s</Success>  <Muted>+$%s</Muted>",
+		formatNumber(State.crashes),
+		formatNumber(gain)
+	))
+
+	return true
+end
+
+local function startFarm()
+	if State.running then
+		return
+	end
+	State.running = true
+	State.__stopped = false
+	State.sessionStart = os.clock()
+	State.sessionStartMoney = getMoney()
+
+	task.spawn(function()
+		local failures = 0
+		while State.running do
+			local okCall, cycleOk, err = pcall(runCrashCycle)
+			if not State.running then
+				break
+			end
+			if not okCall then
+				failures = failures + 1
+				Log:Push("<Danger>Cycle error: " .. tostring(cycleOk) .. "</Danger>")
+				task.wait(1)
+			elseif not cycleOk then
+				failures = failures + 1
+				Log:Push("<Warning>" .. tostring(err) .. "</Warning>")
+				task.wait(1)
+			else
+				failures = 0
+			end
+			if failures >= 3 then
+				Log:Push("<Danger>Stopped after 3 failed cycles</Danger>")
+				if AutoFarm then
+					AutoFarm:Set(false)
+				end
+				State.running = false
+				break
+			end
+		end
+		State.running = false
+		State.__stopped = true
+		setPhase("Idle")
+	end)
+end
+
+local function stopFarm()
+	if not State.running then
+		setPhase("Idle")
+		return
+	end
+	State.running = false
+	State.__stopped = true
+	setPhase("Stopping")
+end
+
+----- Farm tab -----
+
+local AutoFarm
+AutoFarm = ControlBox:CreateToggle({
+	Name = "Auto farm",
+	Desc = "Repeats the launch, crash and repair cycle",
+	Flag = "AutoFarm",
+	CurrentValue = false,
+	Callback = function(on)
+		if on then
+			Log:Push("<Success>Auto farm enabled</Success>")
+			startFarm()
+		else
+			stopFarm()
+			Log:Push("<Muted>Auto farm disabled</Muted>")
+		end
+	end,
+})
+
+ControlBox:CreateSlider({
+	Name = "Impact speed",
+	Desc = "How hard the car hits the pit wall",
+	Range = { CONFIG.MinSpeed, CONFIG.MaxSpeed },
+	Increment = 5,
+	Suffix = " stud/s",
+	CurrentValue = CONFIG.DefaultSpeed,
+	Flag = "ImpactSpeed",
+})
+
+ControlBox:CreateSlider({
+	Name = "Settle delay",
+	Desc = "Pause after the crash before the car is parked",
+	Range = { 0.2, 4 },
+	Increment = 0.1,
+	Suffix = " s",
+	CurrentValue = CONFIG.DefaultSettle,
+	Flag = "SettleDelay",
+})
+
+ControlBox:CreateSlider({
+	Name = "Repair timeout",
+	Desc = "How long to wait for the repaired car to come back",
+	Range = { 5, 60 },
+	Increment = 1,
+	Suffix = " s",
+	CurrentValue = CONFIG.DefaultRepairTimeout,
+	Flag = "RepairTimeout",
+})
+
+ControlBox:CreateToggle({
+	Name = "Re-enter car",
+	Desc = "Sits back into the driver seat when you get thrown out",
+	Flag = "ReEnterCar",
+	CurrentValue = CONFIG.DefaultReEnter,
+})
+
+ControlBox:CreateButton({
+	Name = "Run one crash",
+	Style = "Primary",
+	Callback = function()
+		if State.running then
+			Log:Push("<Warning>A farm loop is already running</Warning>")
+			return
+		end
+		task.spawn(function()
+			State.__stopped = false
+			local okCall, cycleOk, err = pcall(runCrashCycle)
+			if not okCall then
+				Log:Push("<Danger>Cycle error: " .. tostring(cycleOk) .. "</Danger>")
+			elseif not cycleOk then
+				Log:Push("<Warning>" .. tostring(err) .. "</Warning>")
+			end
+			setPhase("Idle")
+		end)
+	end,
+})
+
+ControlBox:CreateParagraph({
+	Title = "Payout budget",
+	Content = "The server pays crash damage out of a per minute budget, so a fast loop banks "
+		.. "smaller amounts more often and the balance keeps growing either way.",
+})
+
+SpotBox:CreateStatus({
+	Name = "Coordinates",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		return string.format(
+			"<Muted>X</Muted> %.1f  <Muted>Y</Muted> %.1f  <Muted>Z</Muted> %.1f",
+			State.spot.X,
+			State.spot.Y,
+			State.spot.Z
+		)
+	end,
+})
+
+SpotBox:CreateButton({
+	Name = "Capture spot from car",
+	Callback = function()
+		local car = getCar()
+		if not car then
+			Log:Push("<Warning>Your car was not found</Warning>")
+			return
+		end
+		local pivot = car:GetPivot()
+		local look = pivot.LookVector
+		local flat = Vector3.new(look.X, 0, look.Z)
+		if flat.Magnitude < 0.01 then
+			flat = DEFAULT_DIRECTION
+		end
+		State.spot = pivot.Position
+		State.direction = flat.Unit
+		Log:Push(string.format(
+			"<Success>Spot saved</Success>  <Muted>%.1f, %.1f, %.1f</Muted>",
+			State.spot.X,
+			State.spot.Y,
+			State.spot.Z
+		))
+	end,
+})
+
+SpotBox:CreateButton({
+	Name = "Reset spot to default",
+	Style = "Secondary",
+	Callback = function()
+		State.spot = DEFAULT_SPOT
+		State.direction = DEFAULT_DIRECTION
+		Log:Push("<Muted>Spot reset to the recorded pit point</Muted>")
+	end,
+})
+
+StatusBox:CreateStatus({
+	Name = "State",
+	Style = "Row",
+	Pin = true,
+	UpdateRate = 0.25,
+	Update = function()
+		if State.running then
+			return "<Success>" .. tostring(State.phase) .. "</Success>"
+		end
+		return "<Muted>" .. tostring(State.phase) .. "</Muted>"
+	end,
+})
+
+StatusBox:CreateStatus({
+	Name = "Crashes",
+	Style = "Row",
+	UpdateRate = 0.5,
+	Update = function()
+		return formatNumber(State.crashes)
+	end,
+})
+
+StatusBox:CreateStatus({
+	Name = "Earned",
+	Style = "Row",
+	Pin = true,
+	UpdateRate = 0.5,
+	Update = function()
+		return "<Success>$" .. formatNumber(sessionEarned()) .. "</Success>"
+	end,
+})
+
+StatusBox:CreateStatus({
+	Name = "Per minute",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		local elapsed = os.clock() - State.sessionStart
+		if elapsed < 5 then
+			return "<Muted>-</Muted>"
+		end
+		return "<Muted>$</Muted>" .. formatNumber(sessionEarned() / (elapsed / 60))
+	end,
+})
+
+StatusBox:CreateStatus({
+	Name = "Balance",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		return "<Muted>$</Muted>" .. formatNumber(getMoney())
+	end,
+})
+
+----- Settings tab -----
+
+SettingsBox:CreateButton({
+	Name = "Reset counters",
+	Style = "Secondary",
+	Callback = function()
+		State.crashes = 0
+		State.earned = 0
+		State.lastGain = 0
+		State.sessionStart = os.clock()
+		State.sessionStartMoney = getMoney()
+		Log:Push("<Muted>Counters reset</Muted>")
+	end,
+})
+
+SettingsBox:CreateButton({
+	Name = "Stop farm",
+	Callback = function()
+		stopFarm()
+		if AutoFarm then
+			AutoFarm:Set(false, true)
+		end
+		Log:Push("<Muted>Farm stopped</Muted>")
+	end,
+})
+
+SettingsBox:CreateDivider({ Text = "Build " .. VERSION })
+
+local SettingsRight = SettingsTab:CreateGroupbox({ Name = "Configs", Side = "Right" })
+SettingsRight:CreateConfigManager({ Name = "Configs" })
+
+----- Car Mods tab -----
+
+local ModsBox = ModsTab:CreateGroupbox({ Name = "Handling", Side = "Left" })
+local ModsInfoBox = ModsTab:CreateGroupbox({ Name = "Status", Side = "Right" })
+
+local ModsToggle
+ModsToggle = ModsBox:CreateToggle({
+	Name = "Speed & Handling",
+	Desc = "Boosts acceleration and cornering grip",
+	Flag = "ModsEnabled",
+	CurrentValue = false,
+	Callback = function(on)
+		MODS.Enabled = on
+		Log:Push(on and "<Success>Car mods enabled</Success>" or "<Muted>Car mods disabled</Muted>")
+	end,
+})
+
+ModsBox:CreateSlider({
+	Name = "Speed Boost",
+	Desc = "Extra push while the throttle is held",
+	Range = { 0, 200 },
+	Increment = 1,
+	CurrentValue = MODS.SpeedBoost,
+	Flag = "ModsSpeedBoost",
+	Callback = function(value)
+		MODS.SpeedBoost = value
+	end,
+})
+
+ModsBox:CreateSlider({
+	Name = "Max Speed",
+	Desc = "The boost stops here",
+	Range = { 100, 600 },
+	Increment = 5,
+	Suffix = " km/h",
+	CurrentValue = MODS.MaxSpeedLimit,
+	Flag = "ModsMaxSpeed",
+	Callback = function(value)
+		MODS.MaxSpeedLimit = value
+	end,
+})
+
+ModsBox:CreateSlider({
+	Name = "Turn Speed",
+	Desc = "How hard the car rotates into a corner",
+	Range = { 0, 100 },
+	Increment = 1,
+	Suffix = "%",
+	CurrentValue = MODS.TurnAssist,
+	Flag = "ModsTurnAssist",
+	Callback = function(value)
+		MODS.TurnAssist = value
+	end,
+})
+
+ModsInfoBox:CreateStatus({
+	Name = "Car mods",
+	Style = "Row",
+	Pin = true,
+	UpdateRate = 0.5,
+	Update = function()
+		if not MODS.Enabled then
+			return "<Muted>Off</Muted>"
+		end
+		if getVehicleSeat() then
+			return "<Success>Active</Success>"
+		end
+		return "<Warning>No driver seat</Warning>"
+	end,
+})
+
+ModsInfoBox:CreateParagraph({
+	Title = "How it works",
+	Content = "The assist adds velocity on top of the game's own physics while you hold "
+		.. "the throttle or steer. It does nothing while the crash farm drives the car.",
+})
+
+----- Panic key and API -----
+
+local API = {}
+
+function API.GetStats()
+	return {
+		running = State.running,
+		phase = State.phase,
+		crashes = State.crashes,
+		earned = sessionEarned(),
+		lastGain = State.lastGain,
+		balance = getMoney(),
+		spot = State.spot,
+	}
+end
+
+function API.Start()
+	if AutoFarm then
+		AutoFarm:Set(true)
+	end
+	startFarm()
+end
+
+function API.Stop()
+	stopFarm()
+	if AutoFarm then
+		AutoFarm:Set(false, true)
+	end
+end
+
+function API.SetSpot(position, direction)
+	if typeof(position) == "Vector3" then
+		State.spot = position
+	end
+	if typeof(direction) == "Vector3" and direction.Magnitude > 0.01 then
+		State.direction = Vector3.new(direction.X, 0, direction.Z).Unit
+	end
+end
+
+local panicConnection = nil
+local antiAfkConnection = nil
+do
+	panicConnection = UserInputService.InputBegan:Connect(function(input, processed)
+		if processed then
+			return
+		end
+		if input.KeyCode == Enum.KeyCode.End then
+			if type(API.Destroy) == "function" then
+				API.Destroy()
+			end
+		end
+	end)
+end
+
+function API.Destroy()
+	stopFarm()
+	State.running = false
+	State.__stopped = true
+	if panicConnection then
+		pcall(function()
+			panicConnection:Disconnect()
+		end)
+		panicConnection = nil
+	end
+	if modsConnection then
+		pcall(function()
+			modsConnection:Disconnect()
+		end)
+		modsConnection = nil
+	end
+	if antiAfkConnection then
+		pcall(function()
+			antiAfkConnection:Disconnect()
+		end)
+		antiAfkConnection = nil
+	end
+	pcall(function()
+		Window:Destroy()
+	end)
+	if getgenv().RobScriptBNG == API then
+		getgenv().RobScriptBNG = nil
+	end
+end
+
+getgenv().RobScriptBNG = API
+
+----- Anti-AFK -----
+
+-- Always on, no toggle. The client raises Idled only when it is about to kick for
+-- being idle, so one virtual click there resets that timer and nothing else touches
+-- player input while the farm is running.
+antiAfkConnection = LocalPlayer.Idled:Connect(function()
+	pcall(function()
+		local VirtualUser = game:GetService("VirtualUser")
+		VirtualUser:CaptureController()
+		VirtualUser:ClickButton2(Vector2.new())
+	end)
+end)
+
+----- Initialization -----
+
+Window:LoadAutoload()
+Window:Notify({
+	Title = "Loaded",
+	Content = "BloxNG Crash Farm is ready",
+	Type = "Success",
+})
+
+Log:Push("<Muted>Built for BloxNG crash physics, build " .. VERSION .. "</Muted>")
