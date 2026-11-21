@@ -56,6 +56,10 @@ replaceExactlyOnce([===[    if not iCb then
         Dungeon.logState(cCb, "no rooms on offer")
 ]===], "patch 4")
 
+-- Interface preservada no fork de Folyah/Robly_Airflow.
+-- Faça o fork antes de executar este loader, para que a biblioteca seja encontrada.
+replaceExactlyOnce([===[Core.AIRFLOW_URL = "https://raw.githubusercontent.com/bobloscript/Robly_Airflow/main/Source.luau"]===], [===[Core.AIRFLOW_URL = "https://raw.githubusercontent.com/Folyah/Robly_Airflow/main/Source.luau"]===], "interface Robly Airflow propria")
+
 -- Se o codigo original mudar, a validacao interrompe a execucao em vez de
 -- carregar silenciosamente um script sem o banimento de Regen.
 local run, err = loadstring(source, "=Folyah_AnimeAdventures_RegenBan")
