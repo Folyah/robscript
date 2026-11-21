@@ -47,7 +47,15 @@ replaceExactlyOnce([===[        if not dyb or fyb.score > dyb.score then
 replaceExactlyOnce([===[    if not iCb then
         Dungeon.logState(cCb, "no rooms on offer")
 ]===], [===[    if not iCb then
-        if # Dungeon.rooms(cCb) > 0 then
+        local allRooms = Dungeon.rooms(cCb)
+        local allRegen = #allRooms > 0
+        for _, room in ipairs(allRooms) do
+            if not Dungeon.isRegenCurse(Dungeon.roomCurse(room.r)) then
+                allRegen = false
+                break
+            end
+        end
+        if allRegen then
             Dungeon.note("all available rooms contain Regen; returning to lobby automatically")
             App.saveNow()
             App.request("lobby", "teleport_back_to_lobby")
@@ -55,6 +63,15 @@ replaceExactlyOnce([===[    if not iCb then
         end
         Dungeon.logState(cCb, "no rooms on offer")
 ]===], "patch 4")
+
+-- Garante que um Shrine com Regen seja recusado mesmo se a simulacao falhar.
+replaceExactlyOnce([===[            if Ozb and not Pzb then
+                Kzb = Qzb
+            end
+]===], [===[            if Dungeon.isRegenCurse(Mzb.id) or (Ozb and not Pzb) then
+                Kzb = Dungeon.isRegenCurse(Mzb.id) and "Regen is forbidden in Dungeon" or Qzb
+            end
+]===], "patch 5: Shrine Regen hard ban")
 
 -- Interface preservada no fork de Folyah/Robly_Airflow.
 -- Faça o fork antes de executar este loader, para que a biblioteca seja encontrada.
