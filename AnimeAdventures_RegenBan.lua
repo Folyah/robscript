@@ -1,6 +1,6 @@
--- Folyah: RobScript original completo + unica regra: Regen proibido na Dungeon.
+-- Folyah: RobScript original completo + unica regra: Regen e Curse Random proibidos na Dungeon.
 -- Nao modifica Shielding, lojas, farms, posicionamento ou Summer Hunt.
--- Recusa Regen na sala atual e em caminhos que forcam Regen na proxima sala visivel.
+-- Recusa Regen e Curse Random na sala atual e em caminhos que os tornam obrigatorios na proxima sala visivel.
 -- Fonte original armazenada no proprio repositorio: Folyah/robscript.
 local url = "https://raw.githubusercontent.com/Folyah/robscript/main/AnimeAdventures"
 local source = game:HttpGet(url)
@@ -14,18 +14,19 @@ local function replaceExactlyOnce(before, after, label)
 end
 
 replaceExactlyOnce([===[function Dungeon.curseOk(sxb, txb, uxb, vxb, wxb)
-]===], [===[function Dungeon.isRegenCurse(id)
-    return Dungeon.isCurse(id) and tostring(id):lower():find("regen", 1, true) ~= nil
+]===], [===[function Dungeon.isBannedCurse(id)
+    local curse = tostring(id):lower()
+    return Dungeon.isCurse(curse) and (curse:find("regen", 1, true) ~= nil or curse == "_curse_random")
 end
 
 function Dungeon.curseOk(sxb, txb, uxb, vxb, wxb)
-    if Dungeon.isRegenCurse(sxb) then
-        return false, "Regen is forbidden in Dungeon"
+    if Dungeon.isBannedCurse(sxb) then
+        return false, "Regen and Curse Random are forbidden in Dungeon"
     end
 ]===], "patch 1")
 
 -- Olha a proxima camada de salas que o jogo ja tornou visivel.
--- Ignora Regen na pontuacao das recompensas futuras e evita becos sem saida.
+-- Ignora Regen e Random na pontuacao das recompensas futuras e evita becos sem saida.
 replaceExactlyOnce([===[        local hyb, iyb
         for jyb, kyb in ipairs(Dungeon.after(Uxb, fyb.choice)) do
             local lyb = Dungeon.roomValue(kyb, Xxb)
@@ -37,7 +38,7 @@ replaceExactlyOnce([===[        local hyb, iyb
         local futureRooms = Dungeon.after(Uxb, fyb.choice)
         local futureSafe = 0
         for jyb, kyb in ipairs(futureRooms) do
-            if not Dungeon.isRegenCurse(Dungeon.roomCurse(kyb.r)) then
+            if not Dungeon.isBannedCurse(Dungeon.roomCurse(kyb.r)) then
                 futureSafe = futureSafe + 1
                 local lyb = Dungeon.roomValue(kyb, Xxb)
                 if not hyb or lyb > hyb then
@@ -45,75 +46,75 @@ replaceExactlyOnce([===[        local hyb, iyb
                 end
             end
         end
-        local futureRegenTrap = #futureRooms > 0 and futureSafe == 0
-]===], "patch 2: reject visible future Regen in route planning")
+        local futureBannedTrap = #futureRooms > 0 and futureSafe == 0
+]===], "patch 2: reject visible future banned curses in route planning")
 
 replaceExactlyOnce([===[        local qyb, ryb, syb = pcall(Dungeon.curseGate, fyb, Uxb)
         if qyb and not ryb then
             fyb.blocked = syb
         end
 ]===], [===[        local qyb, ryb, syb = pcall(Dungeon.curseGate, fyb, Uxb)
-        if Dungeon.isRegenCurse(Dungeon.roomCurse(fyb.r)) then
-            fyb.blocked = "Regen is forbidden in Dungeon"
-        elseif futureRegenTrap then
-            fyb.blocked = "all visible next rooms require Regen"
+        if Dungeon.isBannedCurse(Dungeon.roomCurse(fyb.r)) then
+            fyb.blocked = "Regen and Curse Random are forbidden in Dungeon"
+        elseif futureBannedTrap then
+            fyb.blocked = "all visible next rooms require Regen or Curse Random"
         elseif qyb and not ryb then
             fyb.blocked = syb
         end
-]===], "patch 3: block Regen now and unavoidable next-room Regen")
+]===], "patch 3: block banned curses now and in future traps")
 
 replaceExactlyOnce([===[        if not dyb or fyb.score > dyb.score then
             dyb = fyb
         end
-]===], [===[        if not Dungeon.isRegenCurse(Dungeon.roomCurse(fyb.r)) and not futureRegenTrap
+]===], [===[        if not Dungeon.isBannedCurse(Dungeon.roomCurse(fyb.r)) and not futureBannedTrap
             and (not dyb or fyb.score > dyb.score) then
             dyb = fyb
         end
-]===], "patch 4: protect fallback from Regen traps")
+]===], "patch 4: protect fallback from banned curses")
 
 replaceExactlyOnce([===[    if not iCb then
         Dungeon.logState(cCb, "no rooms on offer")
 ]===], [===[    if not iCb then
         local allRooms = Dungeon.rooms(cCb)
-        local regenUnavoidable = #allRooms > 0
+        local bannedUnavoidable = #allRooms > 0
         for _, room in ipairs(allRooms) do
             local nextRooms = Dungeon.after(cCb, room.choice)
             local futureTrap = #nextRooms > 0
             for _, nextRoom in ipairs(nextRooms) do
-                if not Dungeon.isRegenCurse(Dungeon.roomCurse(nextRoom.r)) then
+                if not Dungeon.isBannedCurse(Dungeon.roomCurse(nextRoom.r)) then
                     futureTrap = false
                     break
                 end
             end
-            if not Dungeon.isRegenCurse(Dungeon.roomCurse(room.r)) and not futureTrap then
-                regenUnavoidable = false
+            if not Dungeon.isBannedCurse(Dungeon.roomCurse(room.r)) and not futureTrap then
+                bannedUnavoidable = false
                 break
             end
         end
-        if regenUnavoidable then
-            Dungeon.note("every visible route requires Regen now or in the next room; returning to lobby")
+        if bannedUnavoidable then
+            Dungeon.note("every visible route requires Regen or Curse Random now or next; returning to lobby")
             App.saveNow()
             App.request("lobby", "teleport_back_to_lobby")
             return false
         end
         Dungeon.logState(cCb, "no rooms on offer")
-]===], "patch 5: leave if all visible routes force Regen")
+]===], "patch 5: leave if all visible routes force banned curses")
 
--- Garante que um Shrine com Regen seja recusado mesmo se a simulacao falhar.
+-- Garante que um Shrine com Regen ou Curse Random seja recusado mesmo se a simulacao falhar.
 replaceExactlyOnce([===[            if Ozb and not Pzb then
                 Kzb = Qzb
             end
-]===], [===[            if Dungeon.isRegenCurse(Mzb.id) or (Ozb and not Pzb) then
-                Kzb = Dungeon.isRegenCurse(Mzb.id) and "Regen is forbidden in Dungeon" or Qzb
+]===], [===[            if Dungeon.isBannedCurse(Mzb.id) or (Ozb and not Pzb) then
+                Kzb = Dungeon.isBannedCurse(Mzb.id) and "Regen and Curse Random are forbidden in Dungeon" or Qzb
             end
-]===], "patch 6: Shrine Regen hard ban")
+]===], "patch 6: Shrine Regen and Random hard ban")
 
 -- Interface preservada no fork de Folyah/Robly_Airflow.
 -- Faça o fork antes de executar este loader, para que a biblioteca seja encontrada.
 replaceExactlyOnce([===[Core.AIRFLOW_URL = "https://raw.githubusercontent.com/bobloscript/Robly_Airflow/main/Source.luau"]===], [===[Core.AIRFLOW_URL = "https://raw.githubusercontent.com/Folyah/Robly_Airflow/main/Source.luau"]===], "interface Robly Airflow propria")
 
 -- Se o codigo original mudar, a validacao interrompe a execucao em vez de
--- carregar silenciosamente um script sem o banimento de Regen.
+-- carregar silenciosamente um script sem o banimento de Regen e Curse Random.
 local run, err = loadstring(source, "=Folyah_AnimeAdventures_RegenBan")
 assert(run, err)
 return run()
