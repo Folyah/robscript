@@ -18758,7 +18758,7 @@ function Hunt.text()
         ["Gems"] = "the one that pays the most in gems and pearls. Solo runs skip unsafe cards; Summer matchmaking parties with 2+ players follow rewards first.",
         ["Gems/Luck"] = "Secret Drop first (highest bonus); otherwise the best estimated payout including Summer Pearl multipliers. Solo runs keep safety checks; multiplayer matchmaking follows the reward focus.",
         ["Easiest Win"] = "the one that makes your team strongest, whatever it pays.",
-        ["Smart"] = "what each pays weighed against how much weaker it leaves your team."
+        ["Smart"] = "what each pays weighed against how much weaker it leaves your team. Summer matchmaking parties of 2+ players skip the solo safety veto, while keeping the difficulty score."
     }) [qo]))
     table.insert(ko, string.format("You hold %s Summer Pearls. The farm never trades gems for them, and spends them only on Sunny Stars, only with Open Sunny Stars on.", Utils.fmt(tonumber(Core.cur("SummerPearls")) or 0)))
     return table.concat(ko, "\n")
@@ -35373,6 +35373,8 @@ function Match.huntChoose(d0b, e0b)
     local partyCount = #Players:GetPlayers()
     local matchmakingParty = Match.hunt == true and Config.mmEvent == true and partyCount > 1
     local partyRewardFocus = matchmakingParty and (i0b == "Secret Luck" or i0b == "Gems" or gemLuckFocus)
+    -- Smart: in Summer matchmaking parties, skip solo safety veto but preserve difficulty scoring.
+    local smartMatchmaking = matchmakingParty and i0b == "Smart"
     if matchmakingParty then
         Match.huntHadParty = true
     end
@@ -35394,7 +35396,7 @@ function Match.huntChoose(d0b, e0b)
             q0b = q0b * Hunt.weatherStrength(p0b.weather) / math.max(0.05, h0b)
         end
         local v0b = type(p0b) == "table" and Hunt.cardGems(p0b, e0b) or 0
-        local w0b = partyRewardFocus or q0b >= 1 or (Match.fhP * q0b >= f0b and not g0b)
+        local w0b = partyRewardFocus or smartMatchmaking or q0b >= 1 or (Match.fhP * q0b >= f0b and not g0b)
         local x0b = math.log(math.max(0.05, q0b))
         local y0b = x0b * Hunt.STRENGTH_GEMS + (w0b and v0b or - 1000)
         local z0b = Hunt.cardLuck(p0b)
