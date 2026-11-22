@@ -18754,8 +18754,9 @@ function Hunt.text()
     end
     local qo = table.find(Hunt.CARD_PICKS, Config.huntCards) and Config.huntCards or "Smart"
     table.insert(ko, "Cards: " .. (({
-        ["Secret Luck"] = "the most secret luck, then the most pay. Secret luck only comes on the harder cards, so one is skipped when it would leave your team too weak to win.",
-        ["Gems"] = "the one that pays the most in gems and pearls, skipping any that would leave your team too weak to win.",
+        ["Secret Luck"] = "the most secret luck, then the most pay. Solo runs skip unsafe cards; Summer matchmaking parties with 2+ players follow this focus without the solo safety veto.",
+        ["Gems"] = "the one that pays the most in gems and pearls. Solo runs skip unsafe cards; Summer matchmaking parties with 2+ players follow rewards first.",
+        ["Gems/Luck"] = "Secret Drop first (highest bonus); otherwise the best estimated payout including Summer Pearl multipliers. Solo runs keep safety checks; multiplayer matchmaking follows the reward focus.",
         ["Easiest Win"] = "the one that makes your team strongest, whatever it pays.",
         ["Smart"] = "what each pays weighed against how much weaker it leaves your team."
     }) [qo]))
@@ -35346,6 +35347,7 @@ end
 Hunt.CARD_PICKS = {
     "Secret Luck",
     "Gems",
+    "Gems/Luck",
     "Easiest Win",
     "Smart"
 }
@@ -35367,7 +35369,14 @@ function Match.huntChoose(d0b, e0b)
     local g0b = (Match.pressure or 0) >= Config.safeReach or (Match.depth and Match.depth.leak)
     local h0b = Hunt.weatherStrength(Hunt.weatherNow())
     local i0b = table.find(Hunt.CARD_PICKS, Config.huntCards) and Config.huntCards or "Smart"
-    local j0b, k0b, l0b, m0b
+    local gemLuckFocus = i0b == "Gems/Luck"
+    local partyCount = #Players:GetPlayers()
+    local matchmakingParty = Match.hunt == true and Config.mmEvent == true and partyCount > 1
+    local partyRewardFocus = matchmakingParty and (i0b == "Secret Luck" or i0b == "Gems" or gemLuckFocus)
+    if matchmakingParty then
+        Match.huntHadParty = true
+    end
+    local j0b, k0b, l0b, m0b, bestLuck, bestEligible
     local n0b = {
     }
     for o0b, p0b in pairs(d0b) do
@@ -35385,28 +35394,45 @@ function Match.huntChoose(d0b, e0b)
             q0b = q0b * Hunt.weatherStrength(p0b.weather) / math.max(0.05, h0b)
         end
         local v0b = type(p0b) == "table" and Hunt.cardGems(p0b, e0b) or 0
-        local w0b = q0b >= 1 or (Match.fhP * q0b >= f0b and not g0b)
+        local w0b = partyRewardFocus or q0b >= 1 or (Match.fhP * q0b >= f0b and not g0b)
         local x0b = math.log(math.max(0.05, q0b))
         local y0b = x0b * Hunt.STRENGTH_GEMS + (w0b and v0b or - 1000)
         local z0b = Hunt.cardLuck(p0b)
-        if i0b == "Secret Luck" and w0b and z0b > 0 then
+        if (i0b == "Secret Luck" or gemLuckFocus) and w0b and z0b > 0 then
             y0b = 2e6 + z0b * 1e4 + v0b
-        elseif i0b == "Gems" and w0b then
+        elseif (i0b == "Gems" or gemLuckFocus) and w0b then
             y0b = 1e6 + v0b + x0b
         elseif i0b == "Easiest Win" then
             y0b = x0b * 1e6 + v0b
         end
-        if not k0b or y0b > k0b then
+        local choose = not k0b or y0b > k0b
+        if j0b then
+            if partyRewardFocus then
+                if i0b == "Secret Luck" or gemLuckFocus then
+                    choose = z0b > bestLuck or (z0b == bestLuck and (v0b > m0b or (v0b == m0b and q0b > l0b)))
+                else
+                    choose = v0b > m0b or (v0b == m0b and q0b > l0b)
+                end
+            elseif gemLuckFocus then
+                if w0b ~= bestEligible then
+                    choose = w0b
+                elseif w0b then
+                    choose = z0b > bestLuck or (z0b == bestLuck and (v0b > m0b or (v0b == m0b and q0b > l0b)))
+                end
+            end
+        end
+        if choose then
             j0b, k0b, l0b, m0b = o0b, y0b, q0b, v0b
+            bestLuck, bestEligible = z0b, w0b
         end
         table.insert(n0b, string.format("%s) %s%s [%s] ×%.2f, %d gems: %s", tostring(o0b), tostring(type(p0b) == "table" and p0b.title or "?"), (type(p0b) == "table" and p0b.weather) and (" (" .. tostring(p0b.weather) .. ")") or "", tostring(type(p0b) == "table" and p0b.option_type or "?"), q0b, math.floor(v0b + 0.5), table.concat(r0b, " + ")))
     end
-    return j0b, l0b, m0b, n0b, f0b, g0b, i0b
+    return j0b, l0b, m0b, n0b, f0b, g0b, i0b, partyRewardFocus, partyCount
 end
 
 function Match.huntPick(A0b)
     local B0b = Match.wave()
-    local C0b, D0b, E0b, F0b, G0b, H0b, I0b = Match.huntChoose(A0b, B0b)
+    local C0b, D0b, E0b, F0b, G0b, H0b, I0b, partyRewardFocus, partyCount = Match.huntChoose(A0b, B0b)
     Match.fhP = Match.fhP * (D0b or 1)
     Match.rogueOptions = nil
     local J0b, K0b = pcall(HttpService.JSONEncode, HttpService, Hunt.plain(A0b))
@@ -35415,7 +35441,7 @@ function Match.huntPick(A0b)
     end
     local L0b = App.request("rogue", "select_roguelike_option", C0b)
     local M0b = C0b and Hunt.cardLuck(A0b [C0b]) or 0
-    App.log(1, "ROGUE", string.format("wave %d · picked %s by %s (worth %d gems%s, strength now ×%.2f, floor ×%.2f%s) of: %s", B0b, tostring(C0b), tostring(I0b), math.floor((E0b or 0) + 0.5), M0b > 0 and string.format(", secret luck +%g", M0b) or "", Match.fhP, G0b, H0b and ", under pressure" or "", table.concat(F0b, " | ")))
+    App.log(1, "ROGUE", string.format("wave %d · picked %s by %s (worth %d gems%s, strength now ×%.2f, floor ×%.2f%s%s) of: %s", B0b, tostring(C0b), tostring(I0b), math.floor((E0b or 0) + 0.5), M0b > 0 and string.format(", secret luck +%g", M0b) or "", Match.fhP, G0b, H0b and ", under pressure" or "", partyRewardFocus and string.format(", %d-player matchmaking reward focus: solo safety veto bypassed", partyCount) or "", table.concat(F0b, " | ")))
     return L0b
 end
 
@@ -35423,7 +35449,10 @@ function Match.huntRecord(N0b, O0b, P0b, Q0b)
     local R0b, S0b = pcall(Hunt.starfallRecord)
     Match.starSummary = R0b and S0b or nil
     local T0b = Hunt.floor()
-    Brain.hunt.pmin = Utils.clamp(T0b + (P0b and - 0.1 or 0.1), 0.4, 2)
+    local partyRun = Match.huntHadParty == true or (Config.mmEvent == true and #Players:GetPlayers() > 1)
+    if not partyRun then
+        Brain.hunt.pmin = Utils.clamp(T0b + (P0b and - 0.1 or 0.1), 0.4, 2)
+    end
     Brain.hunt.runs = Brain.hunt.runs or {
     }
     table.insert(Brain.hunt.runs, 1, {
@@ -35434,6 +35463,7 @@ function Match.huntRecord(N0b, O0b, P0b, Q0b)
         mult = Match.fhMult or 1,
         strength = Match.fhP or 1,
         floor = T0b,
+        party = partyRun,
         map = Match.ld.map,
         weather = Hunt.weatherNow(),
         sec = Q0b,
@@ -38232,6 +38262,7 @@ function Match.run()
     Match.buildCandidates()
     Match.random = Match.ld._randomequippedmode ~= nil or Core.session().override_equipped_units ~= nil
     Match.hunt = Hunt.is(Match.ld.id)
+    Match.huntHadParty = false
     if not Match.random then
         local vgc, wgc = pcall(Match.startTeam)
         if not vgc then
@@ -41122,7 +41153,7 @@ function GUI.build()
         end
         if Msc and Msc.hunt then
             wrc.hunt = bsc:Paragraph("…")
-            vrc.huntCardsPick = bsc:Dropdown("Card Pick", "Which of the 3 cards to take each time. None that risks losing the run", Hunt.CARD_PICKS, table.find(Hunt.CARD_PICKS, Config.huntCards) or 1, function(Nsc)
+            vrc.huntCardsPick = bsc:Dropdown("Card Pick", "Vote priority: Secret Luck, Gems, Gems/Luck, Easiest Win or Smart. Summer matchmaking parties of 2+ ignore the solo safety veto for reward-focused options", Hunt.CARD_PICKS, table.find(Hunt.CARD_PICKS, Config.huntCards) or 1, function(Nsc)
                 xrc("huntCards", Nsc)
             end)
             Arc(bsc, "Smart Charm Equip", "Wears the Summer Charm that helps most before a Summer Hunt or a Sky portal: more rewards where your team wins with room to spare, more damage where it might lose", "smartCharm")
