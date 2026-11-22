@@ -18756,7 +18756,7 @@ function Hunt.text()
     table.insert(ko, "Cards: " .. (({
         ["Secret Luck"] = "the most secret luck, then the most pay. Solo runs skip unsafe cards; Summer matchmaking parties with 2+ players follow this focus without the solo safety veto.",
         ["Gems"] = "the one that pays the most in gems and pearls. Solo runs skip unsafe cards; Summer matchmaking parties with 2+ players follow rewards first.",
-        ["Gems/Luck"] = "In Summer matchmaking parties, ranks curses first. Magic Resistance reaching +100 becomes last priority. Ties favor Secret Drop then estimated rewards. Solo keeps its original safety logic.",
+        ["Gems/Luck"] = "Secret Drop first (highest bonus); otherwise the best estimated payout including Summer Pearl multipliers. Solo runs keep safety checks; multiplayer matchmaking follows the reward focus.",
         ["Easiest Win"] = "the one that makes your team strongest, whatever it pays.",
         ["Smart"] = "what each pays weighed against how much weaker it leaves your team."
     }) [qo]))
@@ -35363,103 +35363,6 @@ function Hunt.cardLuck(__b)
     return a0b
 end
 
--- Folyah Summer Hunt: least-harmful card selection for Gems/Luck matchmaking v1
--- Ranks represent fixed priorities, NOT cumulative ceilings or win probabilities.
--- 0 = no identified harmful curse, 1 = health, 2 = speed, 3 = shield,
--- 4 = explosion/other troublesome effects, 5 = resistance,
--- 6 = regeneration, 7 = random harmful effects.
--- 8 = a Magic Resistance card that reaches +100 total or higher.
--- A card's worst curse decides first, then its number/amount of curses.
--- Gems/Luck breaks ties using Secret Drop first, then reward value.
--- Folyah Summer Hunt: Magic Resistance +100 is last priority (v2)
--- Match.fhResist is updated from the game's accepted persistent effects after each vote.
--- This is a card-priority rule, not a restriction on voting.
-function Hunt.magicResistanceTotal()
-    local total = 0
-    for damageType, amount in pairs(Match.fhResist or {}) do
-        local kind = tostring(damageType):lower():gsub("_damage$", "")
-        if kind == "magic" or kind == "magical" then
-            total = total + (tonumber(amount) or 0)
-        end
-    end
-    return total
-end
-
-function Hunt.cursePriority(card)
-    local worst, count, size = 0, 0, 0
-    for _, effect in pairs(type(card) == "table" and type(card.effects) == "table" and card.effects or {}) do
-        if type(effect) == "table" then
-            local kind = tostring(effect.type or ""):lower()
-            local stat = tostring(effect.stat or ""):lower()
-            local passive = tostring(effect.passive or ""):lower()
-            local amount = tonumber(effect.amount) or 0
-            local rank = 0
-            if kind == "enemy_bomb" or kind == "new_path"
-                or kind == "death_explosion" then
-                rank = 4
-            elseif amount > 0 then
-                if kind == "enemy_stat_mul" then
-                    rank = (stat == "health" or stat == "hp") and 1 or 5
-                elseif kind == "enemy_speedup" then
-                    rank = 2
-                elseif kind == "enemy_shield" then
-                    rank = 3
-                elseif kind == "burst_speed" or kind:find("explos", 1, true)
-                    or kind:find("bomb", 1, true) then
-                    rank = 4
-                elseif kind == "enemy_passive_chance" then
-                    rank = 4
-                elseif kind == "enemy_resistance_specific" then
-                    local resistType = tostring(effect.damage_type or ""):lower():gsub("_damage$", "")
-                    if (resistType == "magic" or resistType == "magical")
-                        and (Hunt.magicResistanceTotal() + amount >= 100) then
-                        -- Reaching +100 on this card, or adding more after +100,
-                        -- makes it worse than every other defined curse (rank 8).
-                        rank = 8
-                    else
-                        rank = 5
-                    end
-                elseif kind == "enemy_regen" then
-                    rank = 6
-                elseif kind == "unit_cost" then
-                    rank = 3
-                elseif kind == "lightning_strikes" then
-                    rank = 4
-                elseif kind == "random_effects" and effect._type ~= "Good" then
-                    rank = 7
-                end
-                if rank == 0 and (stat:find("explos", 1, true)
-                    or passive:find("explos", 1, true)
-                    or passive:find("bomb", 1, true)) then
-                    rank = 4
-                end
-            elseif kind == "random_effects" and effect._type ~= "Good" then
-                rank = 7
-            end
-            if rank > 0 then
-                worst = math.max(worst, rank)
-                count = count + 1
-                size = size + math.abs(amount)
-            end
-        end
-    end
-    -- Bad cards with unknown mechanics should not look safer than known harmless cards.
-    if worst == 0 and type(card) == "table" and card.option_type == "Bad" then
-        local knownEffect = false
-        for _, e in pairs(type(card.effects) == "table" and card.effects or {}) do
-            if type(e) == "table" and e.type ~= "candy_multiplier" and e.type ~= "add_reward"
-                and e.type ~= "golem_chance" and e.type ~= "secret_drop" then
-                knownEffect = true
-                break
-            end
-        end
-        if knownEffect then
-            worst, count = 5, 1
-        end
-    end
-    return worst, count, size
-end
-
 function Match.huntChoose(d0b, e0b)
     Match.fhP = Match.fhP or 1
     local f0b = Hunt.floor()
@@ -35474,7 +35377,6 @@ function Match.huntChoose(d0b, e0b)
         Match.huntHadParty = true
     end
     local j0b, k0b, l0b, m0b, bestLuck, bestEligible
-    local bestCurseRisk, bestCurseCount, bestCurseSize
     local n0b = {
     }
     for o0b, p0b in pairs(d0b) do
@@ -35496,7 +35398,6 @@ function Match.huntChoose(d0b, e0b)
         local x0b = math.log(math.max(0.05, q0b))
         local y0b = x0b * Hunt.STRENGTH_GEMS + (w0b and v0b or - 1000)
         local z0b = Hunt.cardLuck(p0b)
-        local curseRisk, curseCount, curseSize = Hunt.cursePriority(p0b)
         if (i0b == "Secret Luck" or gemLuckFocus) and w0b and z0b > 0 then
             y0b = 2e6 + z0b * 1e4 + v0b
         elseif (i0b == "Gems" or gemLuckFocus) and w0b then
@@ -35506,20 +35407,7 @@ function Match.huntChoose(d0b, e0b)
         end
         local choose = not k0b or y0b > k0b
         if j0b then
-            if partyRewardFocus and gemLuckFocus then
-                -- Priorities first: pick the least harmful card, even if all three are bad.
-                -- Only comparable curse burdens are decided by Secret Drop / pearls.
-                if curseRisk ~= bestCurseRisk then
-                    choose = curseRisk < bestCurseRisk
-                elseif curseCount ~= bestCurseCount then
-                    choose = curseCount < bestCurseCount
-                elseif math.abs(curseSize - bestCurseSize) > 0.000001 then
-                    choose = curseSize < bestCurseSize
-                else
-                    choose = z0b > bestLuck or (z0b == bestLuck
-                        and (v0b > m0b or (v0b == m0b and q0b > l0b)))
-                end
-            elseif partyRewardFocus then
+            if partyRewardFocus then
                 if i0b == "Secret Luck" or gemLuckFocus then
                     choose = z0b > bestLuck or (z0b == bestLuck and (v0b > m0b or (v0b == m0b and q0b > l0b)))
                 else
@@ -35536,9 +35424,8 @@ function Match.huntChoose(d0b, e0b)
         if choose then
             j0b, k0b, l0b, m0b = o0b, y0b, q0b, v0b
             bestLuck, bestEligible = z0b, w0b
-            bestCurseRisk, bestCurseCount, bestCurseSize = curseRisk, curseCount, curseSize
         end
-        table.insert(n0b, string.format("%s) %s%s [%s] ×%.2f, %d gems, risk %d: %s", tostring(o0b), tostring(type(p0b) == "table" and p0b.title or "?"), (type(p0b) == "table" and p0b.weather) and (" (" .. tostring(p0b.weather) .. ")") or "", tostring(type(p0b) == "table" and p0b.option_type or "?"), q0b, math.floor(v0b + 0.5), curseRisk, table.concat(r0b, " + ")))
+        table.insert(n0b, string.format("%s) %s%s [%s] ×%.2f, %d gems: %s", tostring(o0b), tostring(type(p0b) == "table" and p0b.title or "?"), (type(p0b) == "table" and p0b.weather) and (" (" .. tostring(p0b.weather) .. ")") or "", tostring(type(p0b) == "table" and p0b.option_type or "?"), q0b, math.floor(v0b + 0.5), table.concat(r0b, " + ")))
     end
     return j0b, l0b, m0b, n0b, f0b, g0b, i0b, partyRewardFocus, partyCount
 end
@@ -38376,10 +38263,6 @@ function Match.run()
     Match.random = Match.ld._randomequippedmode ~= nil or Core.session().override_equipped_units ~= nil
     Match.hunt = Hunt.is(Match.ld.id)
     Match.huntHadParty = false
-    if Match.hunt then
-        -- Start a fresh match without resistance data from the previous run.
-        Match.fhResist = {}
-    end
     if not Match.random then
         local vgc, wgc = pcall(Match.startTeam)
         if not vgc then
@@ -41270,7 +41153,7 @@ function GUI.build()
         end
         if Msc and Msc.hunt then
             wrc.hunt = bsc:Paragraph("…")
-            vrc.huntCardsPick = bsc:Dropdown("Card Pick", "Choose card focus. Gems/Luck in Summer matchmaking parties of 2+ ranks curses first; Magic Resistance reaching +100 is last priority; ties favor Secret Drop then rewards. Solo keeps safety.", Hunt.CARD_PICKS, table.find(Hunt.CARD_PICKS, Config.huntCards) or 1, function(Nsc)
+            vrc.huntCardsPick = bsc:Dropdown("Card Pick", "Vote priority: Secret Luck, Gems, Gems/Luck, Easiest Win or Smart. Summer matchmaking parties of 2+ ignore the solo safety veto for reward-focused options", Hunt.CARD_PICKS, table.find(Hunt.CARD_PICKS, Config.huntCards) or 1, function(Nsc)
                 xrc("huntCards", Nsc)
             end)
             Arc(bsc, "Smart Charm Equip", "Wears the Summer Charm that helps most before a Summer Hunt or a Sky portal: more rewards where your team wins with room to spare, more damage where it might lose", "smartCharm")
