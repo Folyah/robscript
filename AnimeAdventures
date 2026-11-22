@@ -18757,7 +18757,7 @@ function Hunt.text()
         ["Secret Luck"] = "the most secret luck, then the most pay. Solo runs skip unsafe cards; Summer matchmaking parties with 2+ players follow this focus without the solo safety veto.",
         ["Gems"] = "the one that pays the most in gems and pearls. Solo runs skip unsafe cards; Summer matchmaking parties with 2+ players follow rewards first.",
         ["Gems/Luck"] = "Secret Drop first (highest bonus); otherwise the best estimated payout including Summer Pearl multipliers. Solo runs keep safety checks; multiplayer matchmaking follows the reward focus.",
-        ["Easiest Win"] = "the one that makes your team strongest, whatever it pays.",
+        ["Easiest Win"] = "Any Secret Drop card first (highest Secret Drop bonus, then strongest team if tied). With no Secret Drop, chooses the card that makes your team strongest.",
         ["Smart"] = "what each pays weighed against how much weaker it leaves your team. Summer matchmaking parties of 2+ players skip the solo safety veto, while keeping the difficulty score."
     }) [qo]))
     table.insert(ko, string.format("You hold %s Summer Pearls. The farm never trades gems for them, and spends them only on Sunny Stars, only with Open Sunny Stars on.", Utils.fmt(tonumber(Core.cur("SummerPearls")) or 0)))
@@ -35409,7 +35409,25 @@ function Match.huntChoose(d0b, e0b)
         end
         local choose = not k0b or y0b > k0b
         if j0b then
-            if partyRewardFocus then
+            if i0b == "Easiest Win" then
+                -- Summer Hunt: any Secret Drop wins over a card without Secret Drop.
+                -- If both have Secret Drop, choose the highest amount first;
+                -- only if tied, choose the card that preserves more team strength.
+                -- If neither has Secret Drop, keep the original Easiest Win score.
+                local currentHasSecret = z0b > 0
+                local bestHasSecret = (bestLuck or 0) > 0
+                if currentHasSecret ~= bestHasSecret then
+                    choose = currentHasSecret
+                elseif currentHasSecret then
+                    if z0b ~= bestLuck then
+                        choose = z0b > bestLuck
+                    elseif q0b ~= l0b then
+                        choose = q0b > l0b
+                    else
+                        choose = v0b > m0b
+                    end
+                end
+            elseif partyRewardFocus then
                 if i0b == "Secret Luck" or gemLuckFocus then
                     choose = z0b > bestLuck or (z0b == bestLuck and (v0b > m0b or (v0b == m0b and q0b > l0b)))
                 else
