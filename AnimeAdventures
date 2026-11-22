@@ -35450,19 +35450,99 @@ function Match.huntChoose(d0b, e0b)
     return j0b, l0b, m0b, n0b, f0b, g0b, i0b, partyRewardFocus, partyCount
 end
 
+-- Folyah Summer: reliable Secret Drop vote 2026-11-22
+-- Keep the cards available until the game's result event; retry only as necessary.
 function Match.huntPick(A0b)
-    local B0b = Match.wave()
-    local C0b, D0b, E0b, F0b, G0b, H0b, I0b, partyRewardFocus, partyCount = Match.huntChoose(A0b, B0b)
-    Match.fhP = Match.fhP * (D0b or 1)
-    Match.rogueOptions = nil
-    local J0b, K0b = pcall(HttpService.JSONEncode, HttpService, Hunt.plain(A0b))
-    if J0b then
-        Hunt.write("hunt_cards.txt", string.format("%s wave %d map %s weather %s: %s", os.date("%m-%d %H:%M"), B0b, tostring(Match.ld.map), tostring(Hunt.weatherNow()), K0b))
+    local wave = Match.wave()
+    if Match.huntVoteDone == wave then
+        return true
     end
-    local L0b = App.request("rogue", "select_roguelike_option", C0b)
-    local M0b = C0b and Hunt.cardLuck(A0b [C0b]) or 0
-    App.log(1, "ROGUE", string.format("wave %d · picked %s by %s (worth %d gems%s, strength now ×%.2f, floor ×%.2f%s%s) of: %s", B0b, tostring(C0b), tostring(I0b), math.floor((E0b or 0) + 0.5), M0b > 0 and string.format(", secret luck +%g", M0b) or "", Match.fhP, G0b, H0b and ", under pressure" or "", partyRewardFocus and string.format(", %d-player matchmaking reward focus: solo safety veto bypassed", partyCount) or "", table.concat(F0b, " | ")))
-    return L0b
+    if type(A0b) ~= "table" or not next(A0b) then
+        return false
+    end
+    local previous = Match.huntVote
+    -- The script checks every ~3 seconds; never override a recent vote with a blind vote.
+    if previous and previous.wave == wave and Utils.now() - previous.at < 9 then
+        return previous.sent == true
+    end
+
+    local chosen, power, reward, descriptions, floor, underPressure, focus, rewardFocus, partyCount = Match.huntChoose(A0b, wave)
+    if chosen == nil or type(A0b[chosen]) ~= "table" then
+        App.log(1, "ROGUE", "Summer: card scorer returned no valid option; no blind vote")
+        return false
+    end
+
+    local secret = Hunt.cardLuck(A0b[chosen])
+    -- The current scorer already prioritizes Secret Drop. This is a defensive
+    -- assertion that corrects any unexpected regression when the focus requires it.
+    if focus == "Easiest Win" or (focus == "Gems/Luck" and rewardFocus) then
+        local bestSlot, bestLuck = nil, secret
+        for slot, card in pairs(A0b) do
+            if type(card) == "table" then
+                local amount = Hunt.cardLuck(card)
+                if amount > bestLuck then
+                    bestSlot, bestLuck = slot, amount
+                end
+            end
+        end
+        if bestSlot then
+            App.log(1, "ROGUE", "WARNING: Secret Drop priority repaired; replaced card " .. tostring(chosen) .. " by " .. tostring(bestSlot))
+            chosen, secret = bestSlot, bestLuck
+            local updatedCard = A0b[chosen]
+            local correctedPower = 1
+            for _, effect in pairs(type(updatedCard.effects) == "table" and updatedCard.effects or {}) do
+                if type(effect) == "table" then
+                    correctedPower = correctedPower * Match.rogueEffect(effect)
+                end
+            end
+            if updatedCard.weather then
+                correctedPower = correctedPower * Hunt.weatherStrength(updatedCard.weather) / math.max(0.05, Hunt.weatherStrength(Hunt.weatherNow()))
+            end
+            power = correctedPower
+            reward = Hunt.cardGems(updatedCard, wave)
+        end
+    end
+
+    -- If retrying because of a network error or no result callback, reuse the
+    -- original card instead of switching to another choice mid-vote.
+    if previous and previous.wave == wave and A0b[previous.slot] then
+        chosen = previous.slot
+        secret = Hunt.cardLuck(A0b[chosen])
+    end
+
+    local firstAttempt = not previous or previous.wave ~= wave
+    if firstAttempt then
+        local okEncode, encoded = pcall(HttpService.JSONEncode, HttpService, Hunt.plain(A0b))
+        if okEncode then
+            Hunt.write("hunt_cards.txt", string.format("%s wave %d map %s weather %s: %s", os.date("%m-%d %H:%M"), wave, tostring(Match.ld.map), tostring(Hunt.weatherNow()), encoded))
+        end
+    end
+
+    local voteState = {
+        wave = wave,
+        slot = chosen,
+        at = Utils.now(),
+        luck = secret,
+        counted = previous and previous.wave == wave and previous.counted or false,
+        sent = false
+    }
+    Match.huntVote = voteState
+    local sent, response = App.request("rogue", "select_roguelike_option", chosen)
+    local acceptedTransport = sent == true and response ~= false
+    if acceptedTransport then
+        voteState.sent = true
+        if Match.huntVote == voteState and not voteState.counted then
+            Match.fhP = (Match.fhP or 1) * (power or 1)
+            voteState.counted = true
+        end
+    end
+    App.log(1, "ROGUE", string.format(
+        "Summer wave %d: %s option %s by %s (secret +%g; group %d; %s)",
+        wave, acceptedTransport and "VOTE SENT, group result pending" or "VOTE FAILED, will retry",
+        tostring(chosen), tostring(focus), secret, tonumber(partyCount) or #Players:GetPlayers(),
+        acceptedTransport and "cards retained" or tostring(response)))
+    -- IMPORTANT: do NOT set Match.rogueOptions=nil here.
+    return acceptedTransport
 end
 
 function Match.huntRecord(N0b, O0b, P0b, Q0b)
@@ -35525,8 +35605,24 @@ end
 
 function Match.pickRogue()
     local b1b = Match.rogueOptions
-    if b1b and Match.hunt then
-        return Match.huntPick(b1b)
+    if Match.hunt then
+        local wave = Match.wave()
+        if Match.huntVoteDone == wave then
+            return true
+        end
+        if Match.huntVote and Match.huntVote.wave ~= wave then
+            -- Stale cards belong to a previous wave; do not cast a random vote.
+            Match.huntVote = nil
+            Match.rogueOptions = nil
+            b1b = nil
+        end
+        if type(b1b) == "table" and next(b1b) then
+            return Match.huntPick(b1b)
+        end
+        if FarmHub.every("summerMissingCards", 12) then
+            App.log(1, "ROGUE", "Summer: voting open but card options not received; waiting instead of blindly voting card 1")
+        end
+        return false
     end
     if not b1b then
         local c1b = App.request("rogue", "select_roguelike_option", 1)
@@ -38283,6 +38379,8 @@ function Match.run()
     Match.random = Match.ld._randomequippedmode ~= nil or Core.session().override_equipped_units ~= nil
     Match.hunt = Hunt.is(Match.ld.id)
     Match.huntHadParty = false
+    Match.huntVote = nil
+    Match.huntVoteDone = nil
     if not Match.random then
         local vgc, wgc = pcall(Match.startTeam)
         if not vgc then
@@ -38474,9 +38572,29 @@ function Match.run()
     end))
     table.insert(App.conns, mhc.show_roguelike_options.OnClientEvent:Connect(function(ohc, phc)
         Match.rogueOptions = phc
+        if Match.hunt and type(phc) == "table" then
+            if Match.huntVoteDone ~= Match.wave() then
+                -- New cards: the same vote can be retried, but not overridden.
+                if not (Match.huntVote and Match.huntVote.wave == Match.wave()) then
+                    Match.huntVote = nil
+                end
+            else
+                -- A new set of cards means a new vote, even if the wave number repeats.
+                Match.huntVoteDone = nil
+                Match.huntVote = nil
+            end
+        end
     end))
     if mhc:FindFirstChild("show_roguelike_vote_result") then
         table.insert(App.conns, mhc.show_roguelike_vote_result.OnClientEvent:Connect(function(qhc, rhc)
+            if Match.hunt then
+                local vote = Match.huntVote
+                local winner = type(qhc) == "table" and (qhc.title or qhc.name or qhc.id or "unknown") or tostring(qhc)
+                App.log(1, "ROGUE", string.format("Summer wave %d RESULT: my option %s (secret +%g); group picked %s", Match.wave(), vote and tostring(vote.slot) or "unknown", vote and (tonumber(vote.luck) or 0) or 0, tostring(winner)))
+                Match.huntVoteDone = Match.wave()
+                Match.huntVote = nil
+                Match.rogueOptions = nil
+            end
             if type(rhc) == "table" then
                 Match.fhMult = 1 + (tonumber(rhc.candy_multiplier) or 0)
                 local shc, thc = {
