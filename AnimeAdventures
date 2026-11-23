@@ -999,6 +999,7 @@ Core.HIVE_URL = ""
 Core.WEBHOOK_URL = ""
 Core.DEFAULTS = {
     master = true,
+    manualOnly = false,
     rewards = true,
     goldShop = true,
     goldFloor = 300000,
@@ -26731,7 +26732,14 @@ function FarmHub.run()
         end
     end)
     while App.alive do
-        if Config.master and not Brain.holdLobby then
+        if Config.manualOnly then
+            if Brain.pending or Brain.startTeam then
+                Brain.pending = nil
+                Brain.startTeam = nil
+                App.saveSoon()
+            end
+            App.status("Mode", Config.master and "Manual Play: choose a stage yourself; battle AI is ready" or "Manual Play: turn Auto Farm ON to let the AI fight")
+        elseif Config.master and not Brain.holdLobby then
             if Brain.str.reequip then
                 pcall(Strategy.reequip)
             end
@@ -37916,9 +37924,11 @@ function Match.finish()
         end
     end
     local Bec = nil
-    pcall(function()
-        Bec = Modes.pick()
-    end)
+    if not Config.manualOnly then
+        pcall(function()
+            Bec = Modes.pick()
+        end)
+    end
     if Bec and Bec.kind == "story" and Bec.first and xec and Bec.level ~= xec and not Brain.nextMode then
         for Cec, Dec in ipairs(Modes.lastScored or {
         }) do
@@ -37928,7 +37938,7 @@ function Match.finish()
             end
         end
     end
-    if not Bec and xec and Config.onlyStory and (Config.pickStory == "" or Config.pickStory == "progress") and Match.ld._difficulty == "Normal" and not Modes.done((Core.prof() or {
+    if not Config.manualOnly and not Bec and xec and Config.onlyStory and (Config.pickStory == "" or Config.pickStory == "progress") and Match.ld._difficulty == "Normal" and not Modes.done((Core.prof() or {
     }).level_data or {
     }, xec, "Normal") then
         local Eec = "st:" .. xec .. ":Normal"
@@ -37946,6 +37956,16 @@ function Match.finish()
     local Hec = (Match.ld._gamemode == "story" or Match.ld._gamemode == "infinite" or (Match.kind == "event" and Match.ld._OVERRIDE_CAN_REPLAY)) and _cc
     if not Config.play or not Config.master then
         Fec, Gec = "stay", "Auto Play is off"
+    elseif Config.manualOnly then
+        -- Manual Play only: replay the exact match already selected by the player.
+        -- Never select a different stage, story act, raid or new Dungeon.
+        local canManualReplay = Match.ld._gamemode == "story" or Match.ld._gamemode == "infinite"
+            or (Match.kind == "event" and Match.ld._OVERRIDE_CAN_REPLAY)
+        if canManualReplay then
+            Fec, Gec = "replay", "Manual Play: replaying the same stage if the game accepts"
+        else
+            Fec, Gec = "lobby", "Manual Play: replay not supported here; choose the next stage yourself"
+        end
     elseif Bec and Bec.key == bdc and Hec then
         Fec, Gec = "replay", "replaying: still the best mode"
     elseif Bec and Bec.kind == "story" and Match.ld._is_actual_storymode and _cc then
@@ -38012,7 +38032,7 @@ function Match.finish()
         Brain.startTeam = nil
         Fec, Gec = "lobby", "lobby: the next dungeon room didn't start from here"
     end
-    Brain.pending = (Fec == "replay" or Fec == "next_story") and {
+    Brain.pending = (Fec == "replay" or Fec == "next_story") and Bec and {
         key = Bec.key,
         kind = Bec.kind,
         level = Bec.level,
@@ -38020,7 +38040,7 @@ function Match.finish()
         label = Bec.label,
         at = os.time()
     } or nil
-    if Fec == "next_story" or Fec == "replay" then
+    if (Fec == "next_story" or Fec == "replay") and Bec then
         Brain.startTeam = {
             train = {
                 key = Bec.key,
@@ -41106,8 +41126,23 @@ function GUI.build()
     Yrc(bsc, "Turn it on and watch it work. Every other tab is for when you want to choose something yourself.")
     vrc.master = bsc:Toggle("Auto Farm", "Picks the modes, plays them and runs your picks. Off: it plays nothing, but the summons, fuses and stars you switched on still run in the lobby", Config.master, function(csc)
         xrc("master", csc)
-        urc:Status(csc and "▶ Farming" or "⏸ Paused")
+        urc:Status(csc and (Config.manualOnly and "🎮 Manual Play" or "▶ Farming") or "⏸ Paused")
     end)
+    vrc.manualOnly = bsc:Toggle("Manual Play Only",
+        "Choose and enter the stage yourself. RobScript plays the battle and replays the SAME stage when possible. No automatic lobby stage selection, team changes, summon, Dungeon start or mode switching.",
+        Config.manualOnly, function(enabled)
+            xrc("manualOnly", enabled)
+            if enabled then
+                Brain.pending = nil
+                Brain.startTeam = nil
+                Modes.lastScored = nil
+                App.log(1, "MODE", "Manual Play ON: no automatic stage selection; join a stage yourself")
+            else
+                App.log(1, "MODE", "Manual Play OFF: original automatic mode selection restored")
+            end
+            urc:Status(enabled and (Config.master and "🎮 Manual Play" or "⏸ Auto Farm is off") or (Config.master and "▶ Farming" or "⏸ Paused"))
+            App.saveSoon()
+        end)
     bsc:Section("Right now")
     GUI.nowCard = bsc:StatusCard({
         icon = "⏳",
