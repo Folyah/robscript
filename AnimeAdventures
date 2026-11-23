@@ -1000,6 +1000,8 @@ Core.WEBHOOK_URL = ""
 Core.DEFAULTS = {
     master = true,
     manualOnly = false,
+    manualReplay = true,
+    manualNext = false,
     rewards = true,
     goldShop = true,
     goldFloor = 300000,
@@ -37957,14 +37959,26 @@ function Match.finish()
     if not Config.play or not Config.master then
         Fec, Gec = "stay", "Auto Play is off"
     elseif Config.manualOnly then
-        -- Manual Play only: replay the exact match already selected by the player.
-        -- Never select a different stage, story act, raid or new Dungeon.
+        -- Manual Play never calls Modes.pick(). Next means ONLY the next Story act
+        -- or the next room of the Dungeon the player entered manually.
+        -- If both options are on, Next wins; Replay is a fallback.
         local canManualReplay = Match.ld._gamemode == "story" or Match.ld._gamemode == "infinite"
             or (Match.kind == "event" and Match.ld._OVERRIDE_CAN_REPLAY)
-        if canManualReplay then
+        local canManualStoryNext = Config.manualNext and _cc and Match.ld._is_actual_storymode
+            and xec and Modes.open(xec)
+        local canManualDungeonNext = Config.manualNext and _cc and Match.kind == "dungeon"
+        if canManualStoryNext then
+            Fec, Gec = "next_story", "Manual Play: next unlocked Story act"
+        elseif canManualDungeonNext then
+            Fec, Gec = "lobby", "Manual Play: continuing the current Dungeon to the next room"
+        elseif Config.manualReplay and canManualReplay then
             Fec, Gec = "replay", "Manual Play: replaying the same stage if the game accepts"
+        elseif not Config.manualReplay and not Config.manualNext then
+            Fec, Gec = "stay", "Manual Play: Replay and Next off; waiting on the result screen"
+        elseif Config.manualReplay then
+            Fec, Gec = "lobby", "Manual Play: this stage has no Replay; choose another manually"
         else
-            Fec, Gec = "lobby", "Manual Play: replay not supported here; choose the next stage yourself"
+            Fec, Gec = "stay", "Manual Play: no available Next; waiting on the result screen"
         end
     elseif Bec and Bec.key == bdc and Hec then
         Fec, Gec = "replay", "replaying: still the best mode"
@@ -38007,7 +38021,7 @@ function Match.finish()
         }).name or Brain.buyOnce.item) .. " you agreed"
     end
     local Pec
-    if ((Match.kind == "dungeon" and _cc) or Fec == "next_story" or Fec == "replay") and Fec ~= "stay" then
+    if not Config.manualOnly and ((Match.kind == "dungeon" and _cc) or Fec == "next_story" or Fec == "replay") and Fec ~= "stay" then
         local Qec, Rec = pcall(Strategy.hasWork)
         if Qec then
             Pec = Rec
@@ -38018,7 +38032,7 @@ function Match.finish()
             Fec, Gec = "lobby", "lobby: the Units → Upgrades can " .. tostring(Pec)
         end
     end
-    if Match.kind == "dungeon" and Fec ~= "stay" and Bec and Bec.key == "dg" and _cc and # Units.equipped() >= 6 and not Brain.holdLobby and not Brain.buyStorage and not Pec then
+    if Match.kind == "dungeon" and Fec ~= "stay" and ((Config.manualOnly and Config.manualNext) or (not Config.manualOnly and Bec and Bec.key == "dg")) and _cc and # Units.equipped() >= 6 and not Brain.holdLobby and not Brain.buyStorage and not Pec then
         Brain.pending = nil
         App.saveNow()
         App.status("Match", "next dungeon room")
@@ -41129,7 +41143,7 @@ function GUI.build()
         urc:Status(csc and (Config.manualOnly and "🎮 Manual Play" or "▶ Farming") or "⏸ Paused")
     end)
     vrc.manualOnly = bsc:Toggle("Manual Play Only",
-        "Choose and enter the stage yourself. RobScript plays the battle and replays the SAME stage when possible. No automatic lobby stage selection, team changes, summon, Dungeon start or mode switching.",
+        "Choose and enter the stage yourself. RobScript plays the battle without choosing any other stage. Configure Replay and Next using the two switches below.",
         Config.manualOnly, function(enabled)
             xrc("manualOnly", enabled)
             if enabled then
@@ -41142,6 +41156,18 @@ function GUI.build()
             end
             urc:Status(enabled and (Config.master and "🎮 Manual Play" or "⏸ Auto Farm is off") or (Config.master and "▶ Farming" or "⏸ Paused"))
             App.saveSoon()
+        end)
+    vrc.manualReplay = bsc:Toggle("Manual Auto Replay",
+        "Manual Play only: repeat the same stage after a match if the game supports Replay. When Next is also ON, Next has priority.",
+        Config.manualReplay, function(enabled)
+            xrc("manualReplay", enabled)
+            App.log(1, "MODE", "Manual Replay " .. (enabled and "ON" or "OFF"))
+        end)
+    vrc.manualNext = bsc:Toggle("Manual Auto Next",
+        "Manual Play only: on victory advance to the next unlocked Story act, or continue the current Dungeon to its next room. Never chooses unrelated modes. Next wins over Replay if both are ON.",
+        Config.manualNext, function(enabled)
+            xrc("manualNext", enabled)
+            App.log(1, "MODE", "Manual Next " .. (enabled and "ON" or "OFF"))
         end)
     bsc:Section("Right now")
     GUI.nowCard = bsc:StatusCard({
