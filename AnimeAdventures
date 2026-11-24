@@ -970,6 +970,8 @@ local Reports = {
 }
 local Economy = {
 }
+local SynergyBrain = {
+}
 local Simulator = {
 }
 local Adventure = {
@@ -999,9 +1001,6 @@ Core.HIVE_URL = ""
 Core.WEBHOOK_URL = ""
 Core.DEFAULTS = {
     master = true,
-    manualOnly = false,
-    manualReplay = true,
-    manualNext = false,
     rewards = true,
     goldShop = true,
     goldFloor = 300000,
@@ -1038,6 +1037,10 @@ Core.DEFAULTS = {
     dungeon = true,
     dungeonStart = true,
     dungeonValue = 150,
+    -- Independent, user-controlled Dungeon restrictions.
+    dungeonBanRegen = false,
+    dungeonBanFlight = true,
+    dungeonBanRandom = true,
     unlockValue = 20,
     aprilValue = 0.35,
     pearlValue = 0.35,
@@ -16163,6 +16166,11 @@ do
     }
     Brain.learn = bc(ac.learn) or {
     }
+    Brain.synergy = bc(ac.synergy) or {
+    }
+    Brain.synergy.version = 1
+    Brain.synergy.observations = bc(Brain.synergy.observations) or {
+    }
     Brain.learnMarks = ac.learnMarks
     if not Brain.learnMarks then
         Brain.learn.rikka_evolved = nil
@@ -18757,11 +18765,10 @@ function Hunt.text()
     end
     local qo = table.find(Hunt.CARD_PICKS, Config.huntCards) and Config.huntCards or "Smart"
     table.insert(ko, "Cards: " .. (({
-        ["Secret Luck"] = "the most secret luck, then the most pay. Solo runs skip unsafe cards; Summer matchmaking parties with 2+ players follow this focus without the solo safety veto.",
-        ["Gems"] = "the one that pays the most in gems and pearls. Solo runs skip unsafe cards; Summer matchmaking parties with 2+ players follow rewards first.",
-        ["Gems/Luck"] = "Secret Drop first (highest bonus); otherwise the best estimated payout including Summer Pearl multipliers. Solo runs keep safety checks; multiplayer matchmaking follows the reward focus.",
-        ["Easiest Win"] = "Any Secret Drop card first (highest Secret Drop bonus, then strongest team if tied). With no Secret Drop, chooses the card that makes your team strongest.",
-        ["Smart"] = "what each pays weighed against how much weaker it leaves your team. Summer matchmaking parties of 2+ players skip the solo safety veto, while keeping the difficulty score."
+        ["Secret Luck"] = "the most secret luck, then the most pay. Secret luck only comes on the harder cards, so one is skipped when it would leave your team too weak to win.",
+        ["Gems"] = "the one that pays the most in gems and pearls, skipping any that would leave your team too weak to win.",
+        ["Easiest Win"] = "the one that makes your team strongest, whatever it pays.",
+        ["Smart"] = "what each pays weighed against how much weaker it leaves your team."
     }) [qo]))
     table.insert(ko, string.format("You hold %s Summer Pearls. The farm never trades gems for them, and spends them only on Sunny Stars, only with Open Sunny Stars on.", Utils.fmt(tonumber(Core.cur("SummerPearls")) or 0)))
     return table.concat(ko, "\n")
@@ -26734,14 +26741,7 @@ function FarmHub.run()
         end
     end)
     while App.alive do
-        if Config.manualOnly then
-            if Brain.pending or Brain.startTeam then
-                Brain.pending = nil
-                Brain.startTeam = nil
-                App.saveSoon()
-            end
-            App.status("Mode", Config.master and "Manual Play: choose a stage yourself; battle AI is ready" or "Manual Play: turn Auto Farm ON to let the AI fight")
-        elseif Config.master and not Brain.holdLobby then
+        if Config.master and not Brain.holdLobby then
             if Brain.str.reequip then
                 pcall(Strategy.reequip)
             end
@@ -27022,6 +27022,217 @@ function FarmHub.run()
     end
 end
 
+-- SynergyBrain v1: roles from real unit IDs, safe support scoring and milestone planning.
+-- Embedded deliberately: the original loader/teleporter expects a single script.
+-- These are conservative decision heuristics, not verified damage formulas.
+SynergyBrain.KNOWN = {
+    guts_berserker = {label = "Berserker (Rage)", role = "bleed_main", milestone = 5},
+    stain_evolved = {label = "Menace (Terror)", role = "bleed_secondary", milestone = 6},
+    shalltear_evolved = {label = "Bloodcry (Fallen)", role = "bleed_amp"}
+}
+SynergyBrain.DEMON_GIRL = {label = "Demon Girl (Blood Burst)", role = "bleed_burn"}
+SynergyBrain.prev = setmetatable({}, {__mode = "k"})
+SynergyBrain.nextSample = 0
+SynergyBrain.sampleCount = 0
+
+function SynergyBrain.role(id)
+    local known = SynergyBrain.KNOWN[id]
+    if known then
+        return known
+    end
+    -- This new Update 21.5 unit was absent from the original static catalogue.
+    -- Match the exact displayed name from the live game's Units data; never guess its ID.
+    local data = type(Core.Units) == "table" and Core.Units[id] or nil
+    if type(data) == "table" and data.name == "Demon Girl (Blood Burst)" then
+        return SynergyBrain.DEMON_GIRL
+    end
+    return nil
+end
+
+function SynergyBrain.fieldState(field, sim)
+    local state = {bleedDps = 0, bleeders = 0, amp = 0, burn = 0, totalDps = 0}
+    for _, placed in ipairs(field or {}) do
+        local stats = not sim and placed._stats or nil
+        local id = sim and placed.e and placed.e.id or (stats and stats:FindFirstChild("id") and stats.id.Value)
+        local level = sim and (placed.lvl or 0) or (stats and stats:FindFirstChild("upgrade") and stats.upgrade.Value or 0)
+        local role = id and SynergyBrain.role(id)
+        local dps = 0
+        if id then
+            if sim then
+                dps = math.max(0, tonumber(placed.dpsAll or placed.dps) or 0)
+            else
+                local ok, value = pcall(Match.liveDps, placed, id)
+                dps = ok and math.max(0, tonumber(value) or 0) or 0
+            end
+        end
+        state.totalDps = state.totalDps + dps
+        if role and role.role == "bleed_amp" then
+            state.amp = state.amp + 1
+        elseif role and role.role == "bleed_burn" then
+            state.burn = state.burn + 1
+        end
+        if id then
+            local start = Units.bleeds(id)
+            -- Known Berserker/Menace use Bleed even if the game's attack table is incomplete.
+            local knownBleeder = role and (role.role == "bleed_main" or role.role == "bleed_secondary")
+            if (start ~= nil and level >= start) or (knownBleeder and start == nil) then
+                state.bleeders = state.bleeders + 1
+                -- The source's portion of bleed damage is only an approximation.
+                state.bleedDps = state.bleedDps + dps * 0.25
+            end
+        end
+    end
+    state.bleedDps = math.min(state.bleedDps, state.totalDps * 0.45)
+    return state
+end
+
+function SynergyBrain.supportCoverage(rows, level)
+    local before = rows and rows[level]
+    local after = rows and rows[level + 1]
+    if not (before and after) then
+        return 0
+    end
+    local oldRange = math.max(1, tonumber(before.range) or 1)
+    local newRange = math.max(1, tonumber(after.range) or oldRange)
+    local rangeGain = math.max(0, (newRange / oldRange) ^ 2 - 1)
+    local shapeGain = before.atk ~= after.atk and 0.28 or 0
+    return math.min(0.65, rangeGain + shapeGain)
+end
+
+function SynergyBrain.milestone(candidate, unit, current, levelWanted, ctx)
+    if not unit or current >= levelWanted then
+        return 0
+    end
+    local rows = unit.rows or Units.rows(unit.id)
+    if not rows or rows.max < levelWanted then
+        return 0
+    end
+    local totalCost = 0
+    for upgrade = current + 1, levelWanted do
+        local row = rows[upgrade]
+        if not (row and (tonumber(row.cost) or 0) > 0) then
+            return 0
+        end
+        totalCost = totalCost + row.cost
+    end
+    local nextCost = rows[current + 1] and rows[current + 1].cost or 1
+    local factor = math.max(0.5, math.min(2.5, (tonumber(candidate.cost) or 0) / math.max(1, nextCost)))
+    totalCost = totalCost * factor
+    local income = math.max(0, tonumber(ctx.income) or 0)
+    local budget = math.max(0, tonumber(ctx.money) or 0) + income * math.max(0, (ctx.left or 0))
+    if (ctx.left or 0) < 2 or budget < totalCost * 0.9 then
+        return 0
+    end
+    local steps = levelWanted - current
+    -- Bonus is deliberately capped: an unverified ability cannot dominate the economy.
+    return math.max(0, (tonumber(candidate.gain) or 0) * 0.35 / steps)
+end
+
+function SynergyBrain.learnedFactor(id, state)
+    local recs = Brain.synergy and Brain.synergy.observations or {}
+    local key = tostring(id) .. (state.amp > 0 and "|A1" or "|A0") .. (state.burn > 0 and "|N1" or "|N0")
+    local rec = recs[key]
+    if not rec or (rec.n or 0) < 20 then
+        return 1
+    end
+    return Utils.clamp(tonumber(rec.ratio) or 1, 0.90, 1.10)
+end
+
+function SynergyBrain.adjust(candidates, ctx)
+    if not (type(candidates) == "table" and type(ctx) == "table") then
+        return
+    end
+    local state = SynergyBrain.fieldState(ctx.field, ctx.sim)
+    for _, candidate in ipairs(candidates) do
+        local unit = candidate.e or (candidate.c and candidate.c.e)
+        local id = unit and unit.id
+        local role = id and SynergyBrain.role(id)
+        if role and not candidate.farm and (tonumber(candidate.cost) or 0) > 0 then
+            local original = math.max(0, tonumber(candidate.gain) or 0)
+            local placed = candidate.c or candidate.m
+            local current = (ctx.sim and placed and placed.lvl) or
+                (not ctx.sim and placed and placed._stats and placed._stats:FindFirstChild("upgrade") and placed._stats.upgrade.Value) or 0
+            local result = original
+            if role.role == "bleed_amp" or role.role == "bleed_burn" then
+                -- They are utility supports, not the primary damage spenders.
+                local multiplier = role.role == "bleed_amp" and 0.45 or 0.25
+                if candidate.place then
+                    local placedCopies = role.role == "bleed_amp" and state.amp or state.burn
+                    local coverage = math.max(0.10, 0.65 / (1 + placedCopies * 3))
+                    local benefit = state.bleedDps * multiplier * coverage
+                    result = original * 0.12 + benefit
+                    -- No Bleed on the field: don't waste money stacking supports first.
+                    if state.bleeders == 0 then
+                        result = original * 0.06
+                    end
+                else
+                    local coverageGain = SynergyBrain.supportCoverage(unit.rows or Units.rows(id), current)
+                    result = original * 0.08 + state.bleedDps * multiplier * coverageGain
+                    if state.bleeders == 0 then
+                        result = original * 0.04
+                    end
+                end
+            elseif role.role == "bleed_main" or role.role == "bleed_secondary" then
+                local gainFactor = 1 + (state.amp > 0 and 0.18 or 0) + (state.burn > 0 and 0.10 or 0)
+                gainFactor = gainFactor * SynergyBrain.learnedFactor(id, state)
+                result = original * gainFactor
+                if not candidate.place then
+                    result = result + SynergyBrain.milestone(candidate, unit, current, role.milestone, ctx)
+                end
+            end
+            -- Keep the real-price estimate, but replace the team's value estimate.
+            candidate.gain = math.max(0, result)
+            candidate.synergyRole = role.role
+        end
+    end
+end
+
+function SynergyBrain.observe()
+    if not (Match and Match.mine and Brain.synergy) then
+        return
+    end
+    local now = Utils.now()
+    if now < SynergyBrain.nextSample then
+        return
+    end
+    SynergyBrain.nextSample = now + 7
+    local state = SynergyBrain.fieldState(Match.mine, false)
+    local records = Brain.synergy.observations
+    for _, placed in ipairs(Match.mine) do
+        local stats = placed._stats
+        local id = stats and stats:FindFirstChild("id") and stats.id.Value
+        local role = id and SynergyBrain.role(id)
+        local damage = stats and stats:FindFirstChild("total_damage")
+        local level = stats and stats:FindFirstChild("upgrade")
+        if role and damage and level and (role.role == "bleed_main" or role.role == "bleed_secondary") then
+            local stamp = tostring(id) .. (state.amp > 0 and "|A1" or "|A0") .. (state.burn > 0 and "|N1" or "|N0")
+            local previous = SynergyBrain.prev[placed]
+            local okDps, measuredDps = pcall(Match.liveDps, placed, id)
+            local dps = okDps and (tonumber(measuredDps) or 0) or 0
+            if previous and previous.key == stamp and previous.level == level.Value and damage.Value > previous.damage and now > previous.at + 4 then
+                local elapsed = now - previous.at
+                local observed = (damage.Value - previous.damage) / elapsed
+                -- The counter measures total dealt damage, not a clean support experiment.
+                -- Restrict its influence to a 10% calibration after many stable samples.
+                if dps > 0 and observed > 0 and observed < dps * 8 then
+                    local rec = records[stamp] or {n = 0, ratio = 1}
+                    local ratio = Utils.clamp(observed / dps, 0.2, 3)
+                    local alpha = math.min(0.08, 1 / (rec.n + 1))
+                    rec.ratio = rec.ratio + (ratio - rec.ratio) * alpha
+                    rec.n = math.min(500, (rec.n or 0) + 1)
+                    records[stamp] = rec
+                    SynergyBrain.sampleCount = SynergyBrain.sampleCount + 1
+                end
+            end
+            SynergyBrain.prev[placed] = {at = now, key = stamp, damage = damage.Value, level = level.Value}
+        end
+    end
+    if SynergyBrain.sampleCount >= 8 then
+        SynergyBrain.sampleCount = 0
+        App.saveSoon()
+    end
+end
+
 function Economy.upgradeGain(u9, v9, w9, x9, y9, z9)
     local A9, B9 = v9 [w9], v9 [w9 + 1]
     local C9 = (A9.cd > 0 and A9.damage / A9.cd or 0)
@@ -27039,31 +27250,34 @@ function Economy.upgradeGain(u9, v9, w9, x9, y9, z9)
     return math.max(0, E9) * I9
 end
 
-function Economy.dpsFor(J9, K9)
-    if K9 <= 0 then
-        return 0
-    end
-    local L9 = {
-    }
-    for M9, N9 in ipairs(J9) do
-        if not N9.farm and N9.gain > 0 then
-            table.insert(L9, N9)
+-- Conservative defense estimate: only whole, affordable, unique actions count.
+-- The optional ledger persists purchases across projected waves.
+-- Returns (DPS purchased, yen remaining). It deliberately does NOT invent
+-- later upgrades that are absent from the current candidate list.
+function Economy.dpsFor(actions, money, ledger)
+    local remaining = math.max(0, tonumber(money) or 0)
+    local bought = ledger or {}
+    local totalGain = 0
+    while true do
+        local best, bestRatio, bestIndex
+        for index, action in ipairs(actions or {}) do
+            local cost = tonumber(action.cost)
+            local gain = tonumber(action.gain)
+            if not bought[index] and not action.farm and cost and gain and cost >= 0 and gain > 0 and cost <= remaining then
+                local ratio = gain / math.max(1, cost)
+                if not best or ratio > bestRatio then
+                    best, bestRatio, bestIndex = action, ratio, index
+                end
+            end
         end
-    end
-    table.sort(L9, function(O9, P9)
-        return O9.gain / O9.cost > P9.gain / P9.cost
-    end)
-    local Q9, R9 = 0, 0
-    for S9, T9 in ipairs(L9) do
-        if K9 <= 0 then
+        if not best then
             break
         end
-        R9 = T9.gain / T9.cost
-        local U9 = math.min(1, K9 / T9.cost)
-        Q9 = Q9 + T9.gain * U9
-        K9 = K9 - T9.cost * U9
+        bought[bestIndex] = true
+        remaining = remaining - best.cost
+        totalGain = totalGain + best.gain
     end
-    return Q9 + math.max(0, K9) * R9 * 0.7
+    return totalGain, remaining
 end
 
 function Economy.shieldDps(V9, W9, X9, Y9, Z9, _9, aab)
@@ -27130,25 +27344,33 @@ function Economy.bleedShare(Qab, Rab, Sab, Uab)
     return Sab < Rab and Qab / (Rab - Sab) or 0
 end
 
-function Economy.keepsUp(Vab, Wab, Xab, Yab, Zab)
-    local _ab = Vab.coming
-    if not (_ab and # _ab > 0 and Vab.waveSec) then
-        return true
+-- Test defense with a single budget ledger across all upcoming waves.
+-- Unknown wave projections never authorize a speculative farm purchase.
+function Economy.keepsUp(ctx, actions, spend, extraDps, extraFarm)
+    local coming = ctx.coming
+    if type(coming) ~= "table" or #coming == 0 or not tonumber(ctx.waveSec) or ctx.waveSec <= 0 then
+        return nil, nil, nil -- insufficient evidence to approve a farm purchase
     end
-    local abb = Vab.eff or 1
-    local bbb = Vab.money - Xab
-    local cbb = (Vab.teamDps or 0) * (Vab.shieldK or 1) + (Yab or 0) * abb + Economy.dpsFor(Wab, math.max(0, bbb)) * abb
-    local dbb = (Vab.farmNow or 0) + (Zab or 0)
-    local ebb = (Vab.roadSec or 130) * Utils.clamp(Vab.cover or 0.6, 0.1, 1)
-    local fbb = Vab.hpAlive or 0
-    for gbb, hbb in ipairs(_ab) do
-        fbb = math.max(0, fbb + hbb.hp - cbb * Vab.waveSec)
-        local ibb = cbb * ebb
-        if fbb > ibb then
-            return false, gbb, ibb / math.max(1, fbb)
+    local eff = ctx.eff or 1
+    local balance = math.max(0, (ctx.money or 0) - (spend or 0))
+    local purchased = {}
+    local initialGain
+    initialGain, balance = Economy.dpsFor(actions, balance, purchased)
+    local availableDps = (ctx.teamDps or 0) * (ctx.shieldK or 1) + ((extraDps or 0) + initialGain) * eff
+    local farmPerWave = (ctx.farmNow or 0) + (extraFarm or 0)
+    local roadWindow = (ctx.roadSec or 130) * Utils.clamp(ctx.cover or 0.6, 0.1, 1)
+    local hp = ctx.hpAlive or 0
+    for wave, entry in ipairs(coming) do
+        hp = math.max(0, hp + (tonumber(entry.hp) or 0) - availableDps * ctx.waveSec)
+        local killCapacity = availableDps * roadWindow
+        if hp > killCapacity then
+            return false, wave, killCapacity / math.max(1, hp)
         end
-        if gbb < # _ab then
-            cbb = cbb + Economy.dpsFor(Wab, (hbb.reward or 0) + dbb) * abb * (0.85 ^ gbb)
+        if wave < #coming then
+            balance = balance + math.max(0, (tonumber(entry.reward) or 0) + farmPerWave)
+            local addedGain
+            addedGain, balance = Economy.dpsFor(actions, balance, purchased)
+            availableDps = availableDps + addedGain * eff * (0.85 ^ wave)
         end
     end
     return true
@@ -27194,7 +27416,8 @@ function Economy.decide(jbb, kbb)
     if qbb then
         zbb, Abb, Bbb = Economy.keepsUp(kbb, jbb, qbb.cost, 0, qbb.gain)
     end
-    local Cbb = kbb.coming and not Economy.keepsUp(kbb, jbb, 0, 0, 0)
+    local baselineSafe = kbb.coming and Economy.keepsUp(kbb, jbb, 0, 0, 0)
+    local Cbb = baselineSafe == false
     local Dbb = false
     if Match.random and qbb and not pbb and kbb.attackers >= 2 and qbb.payback <= kbb.left / 3 then
         local Ebb = 0
@@ -27246,6 +27469,8 @@ function Economy.decide(jbb, kbb)
             Sbb = string.format("the next waves bring more HP than your units can kill: damage now")
         elseif pbb then
             Sbb = string.format("enemies reach %d%% of the road (your units cover %d%%): damage now", math.floor(kbb.pressure * 100), math.floor(lbb * 100))
+        elseif qbb and zbb == nil then
+            Sbb = "defense first: future waves are unknown, so a farm purchase is not proven safe"
         elseif qbb and not zbb then
             Sbb = string.format("defense first: after that farm buy, wave +%d would only be %d%% covered", Abb or 1, math.floor((Bbb or 0) * 100))
         elseif qbb and nbb then
@@ -29270,6 +29495,13 @@ function Simulator.runRaw(jhb, khb, lhb)
                 })
             end
             local Kob = lhb.oldBuy and 1 or tkb()
+            SynergyBrain.adjust(Ynb, {
+                field = Ehb,
+                sim = true,
+                money = yhb,
+                left = math.max(0, jhb.total - Ahb),
+                income = _nb + (Mhb[Ahb + 1] or 0)
+            })
             local Lob = Economy.decide(Ynb, {
                 money = yhb,
                 left = Eob,
@@ -30706,7 +30938,109 @@ function Dungeon.blindCurse(qxb, rxb)
     return Dungeon.fxText(Dungeon.fx(qxb, rxb)) == Dungeon.fxText(Dungeon.fx(qxb))
 end
 
+-- User-controlled Dungeon curse filters.
+-- Identify actual curse IDs and their effects from DungeonServiceCore.ITEMS,
+-- not human-readable names or the presence of previously acquired curses.
+-- The filters apply to immediate room curses, visible future room curses,
+-- and Shrine offers. Unchecked filters leave those curses to normal simulation.
+function Dungeon.curseFlags(id)
+    local flags = {regen = false, flight = false, random = false}
+    if not Dungeon.isCurse(id) then
+        return flags
+    end
+    local key = tostring(id):lower()
+    -- Known internal IDs, including the stronger Regen variant.
+    flags.regen = key == "_curse_regen" or key == "_curse_super_regen"
+    flags.flight = key == "_curse_fly" or key == "_curse_super_fly"
+    flags.random = key == "_curse_random"
+
+    -- The game data is authoritative for unfamiliar curse IDs.
+    local item = Dungeon.item(id)
+    local effects = type(item) == "table" and type(item.wave_modifier_effects) == "table"
+        and item.wave_modifier_effects or {}
+    for _, effect in pairs(effects) do
+        if type(effect) == "table" then
+            local amount = tonumber(effect.amount)
+            if amount == nil or amount > 0 then
+                if effect.type == "enemy_regen" then
+                    flags.regen = true
+                elseif effect.type == "enemy_passive_chance" and effect.passive == "Flying" then
+                    flags.flight = true
+                elseif effect.type == "random_effects" then
+                    flags.random = true
+                end
+            end
+        end
+    end
+    return flags
+end
+
+function Dungeon.curseHazard(curse, state, precedingCurse)
+    -- The second ID is used only for the visible look-ahead. Existing curses
+    -- in state._items must NOT block every future room or every Shrine.
+    for _, id in ipairs({precedingCurse or false, curse or false}) do
+        if id then
+            local flags = Dungeon.curseFlags(id)
+            if Config.dungeonBanRegen and flags.regen then
+                return "Regen prohibited by Dungeon settings: " .. tostring(id)
+            end
+            if Config.dungeonBanFlight and flags.flight then
+                return "Flight prohibited by Dungeon settings: " .. tostring(id)
+            end
+            if Config.dungeonBanRandom and flags.random then
+                return "Random Curse prohibited by Dungeon settings: " .. tostring(id)
+            end
+        end
+    end
+    return nil
+end
+
+-- Ban Flight covers two independent ways enemies can become airborne:
+-- the Flight curse, and the native Flying Enemies challenge on a room.
+-- This check is per room: a previously obtained Flying curse in _items
+-- does not prevent entering every otherwise-safe room or using Shrines.
+function Dungeon.roomHazard(room, state, precedingCurse)
+    local curseReason = Dungeon.curseHazard(Dungeon.roomCurse(room.r), state, precedingCurse)
+    if curseReason then
+        return curseReason
+    end
+    if Config.dungeonBanFlight then
+        local level = type(room.r._l) == "table" and room.r._l or {}
+        if level._challenge == "flying_enemies" then
+            return "Flying Enemies challenge prohibited by Dungeon settings"
+        end
+    end
+    return nil
+end
+
+-- Reject a path only if EVERY visible next room carries a user-banned curse.
+-- Other risks are left to Dungeon.curseOk / Dungeon.sim.
+function Dungeon.safeFuture(state, room, precedingCurse)
+    local future = Dungeon.after(state, room.choice)
+    if #future == 0 then
+        return true, nil, future
+    end
+    local bestValue, bestRoom
+    local nextCurse = precedingCurse or Dungeon.roomCurse(room.r)
+    for _, nextRoom in ipairs(future) do
+        if not Dungeon.roomHazard(nextRoom, state, nextCurse) then
+            local value = Dungeon.roomValue(nextRoom, Dungeon.res(state))
+            if not bestValue or value > bestValue then
+                bestValue, bestRoom = value, nextRoom
+            end
+        end
+    end
+    if not bestRoom then
+        return false, "all visible next rooms carry a curse banned in Dungeon settings", future
+    end
+    return true, nil, future, bestValue, bestRoom
+end
+
 function Dungeon.curseOk(sxb, txb, uxb, vxb, wxb)
+    local hardReason = Dungeon.curseHazard(sxb, txb)
+    if hardReason then
+        return false, hardReason
+    end
     local xxb = tostring((Dungeon.item(sxb) or {
     }).name or sxb)
     local yxb, zxb, Axb = Dungeon.curseBar(txb, uxb)
@@ -30714,26 +31048,39 @@ function Dungeon.curseOk(sxb, txb, uxb, vxb, wxb)
         return false, string.format("the simulator can't play %s, and %d chests are riding on the run", xxb, Axb)
     end
     local function Bxb(Cxb)
-        return Cxb == nil or (tonumber(Cxb.p) or 1) >= yxb
+        -- Missing simulations cannot certify a difficult/valuable run as safe.
+        if Cxb == nil then
+            return yxb <= 0.2
+        end
+        return (tonumber(Cxb.p) or 0) >= yxb
     end
     if vxb then
         local Dxb, Exb = pcall(Dungeon.sim, vxb, nil, true)
+        if (not Dxb or Exb == nil) and yxb > 0.2 then
+            return false, "this room could not be simulated reliably"
+        end
         if Dxb and not Bxb(Exb) then
-            return false, string.format("with %s your team wouldn't %s (this room: %s)", xxb, (zxb:gsub("them", "this room")), tostring(Exb.margin or "?"))
+            return false, string.format("with %s your team wouldn't %s (this room: %s)", xxb, (zxb:gsub("them", "this room")), tostring(Exb and Exb.margin or "?"))
         end
     end
     if # wxb == 0 then
         return true
     end
-    local Fxb
-    for Gxb, Hxb in ipairs(wxb) do
-        local Ixb, Jxb = pcall(Dungeon.sim, Hxb, sxb, true)
-        if not Ixb or Bxb(Jxb) then
-            return true
+    local Fxb, safeRooms = nil, 0
+    for _, Hxb in ipairs(wxb) do
+        if not Dungeon.roomHazard(Hxb, txb, sxb) then
+            safeRooms = safeRooms + 1
+            local Ixb, Jxb = pcall(Dungeon.sim, Hxb, sxb, true)
+            if Ixb and Bxb(Jxb) then
+                return true
+            end
+            if type(Jxb) == "table" and (not Fxb or (tonumber(Jxb.p) or 0) > (tonumber(Fxb.p) or 0)) then
+                Fxb = Jxb
+            end
         end
-        if not Fxb or (tonumber(Jxb.p) or 0) > (tonumber(Fxb.p) or 0) then
-            Fxb = Jxb
-        end
+    end
+    if safeRooms == 0 then
+        return false, "all visible next rooms contain a Dungeon-banned curse"
     end
     return false, string.format("with %s your team wouldn't %s (the rooms after it, at best: %s)", xxb, zxb, tostring(Fxb and Fxb.margin or "?"))
 end
@@ -30766,52 +31113,66 @@ function Dungeon.payValue()
     return Nxb / Oxb * 0.7
 end
 
-function Dungeon.pick(Uxb)
-    local Vxb, Wxb = Dungeon.curses(Uxb), Dungeon.lives(Uxb)
-    local Xxb = Dungeon.res(Uxb)
-    local Yxb = Dungeon.rooms(Uxb)
-    local Zxb = {
-    }
-    for _xb, ayb in ipairs(Yxb) do
-        table.insert(Zxb, tostring(ayb.r._r))
+function Dungeon.pick(state)
+    local curseCount, lives = Dungeon.curses(state), Dungeon.lives(state)
+    local coins = Dungeon.res(state)
+    local offered = Dungeon.rooms(state)
+    local ids = {}
+    for _, room in ipairs(offered) do
+        table.insert(ids, tostring(room.r._r))
     end
-    local byb = table.concat(Zxb, ",") .. string.format("|%d|%d|%d|%s", Wxb, Xxb, Vxb, Modes.teamSig())
-    if Dungeon._pick and Dungeon._pick.sig == byb then
+    local inventory = {}
+    for id, count in pairs(Dungeon.items(state)) do
+        table.insert(inventory, tostring(id) .. "=" .. tostring(count))
+    end
+    table.sort(inventory)
+    local sig = table.concat(ids, ",") .. string.format("|%d|%d|%d|%s|%s|%s|%s|%s", lives, coins, curseCount, Modes.teamSig(), tostring(Config.dungeonBanRegen), tostring(Config.dungeonBanFlight), tostring(Config.dungeonBanRandom), table.concat(inventory, ","))
+    if Dungeon._pick and Dungeon._pick.sig == sig then
         return Dungeon._pick.x
     end
-    local cyb, dyb
-    for eyb, fyb in ipairs(Yxb) do
-        local gyb = Dungeon.roomValue(fyb, Xxb)
-        local hyb, iyb
-        for jyb, kyb in ipairs(Dungeon.after(Uxb, fyb.choice)) do
-            local lyb = Dungeon.roomValue(kyb, Xxb)
-            if not hyb or lyb > hyb then
-                hyb, iyb = lyb, kyb
+    local best, hardReasons = nil, {}
+    for _, room in ipairs(offered) do
+        room.blocked, room.hardBlocked = nil, nil
+        local value = Dungeon.roomValue(room, coins)
+        local futureOk, futureReason, futureRooms, nextValue, nextRoom = Dungeon.safeFuture(state, room)
+        local reason = Dungeon.roomHazard(room, state)
+        if not reason and not futureOk then
+            reason = futureReason
+        end
+        local p, sim = Dungeon.winP(room)
+        local chance = 1 - (1 - p) ^ math.max(1, lives)
+        local penalty = lives >= 3 and 1 or (lives == 2 and 2 or 6)
+        room.p, room.sim, room.value, room.nextValue, room.nextRoom = p, sim, value, nextValue or 0, nextRoom
+        room.score = chance * (value + 0.6 * (nextValue or 0)) - (1 - p) * penalty
+        room.hardBlocked = reason
+        if reason then
+            room.blocked = reason
+            table.insert(hardReasons, string.format("%s: %s", Dungeon.roomName(room), reason))
+        else
+            local okGate, gateAccepted, gateReason = pcall(Dungeon.curseGate, room, state)
+            if not okGate then
+                room.blocked = "curse simulation unavailable: " .. tostring(gateAccepted)
+            elseif not gateAccepted then
+                room.blocked = gateReason
+            end
+            if not room.blocked and (not best or room.score > best.score) then
+                best = room
             end
         end
-        local myb, nyb = Dungeon.winP(fyb)
-        local oyb = 1 - (1 - myb) ^ math.max(1, Wxb)
-        local pyb = Wxb >= 3 and 1 or (Wxb == 2 and 2 or 6)
-        fyb.p, fyb.sim, fyb.value, fyb.nextValue, fyb.nextRoom = myb, nyb, gyb, hyb or 0, iyb
-        fyb.score = oyb * (gyb + 0.6 * (hyb or 0)) - (1 - myb) * pyb
-        local qyb, ryb, syb = pcall(Dungeon.curseGate, fyb, Uxb)
-        if qyb and not ryb then
-            fyb.blocked = syb
-        end
-        if not fyb.blocked and (not cyb or fyb.score > cyb.score) then
-            cyb = fyb
-        end
-        if not dyb or fyb.score > dyb.score then
-            dyb = fyb
-        end
     end
-    cyb = cyb or dyb
-    Dungeon._pick = {
-        sig = byb,
-        x = cyb,
-        rooms = Yxb
-    }
-    return cyb
+    -- Never force an option the safety gate rejected just because all
+    -- offered rooms are risky. Hold and let the user decide manually.
+    if not best and # offered > 0 then
+        local summary = # hardReasons > 0 and table.concat(hardReasons, " | ") or "all rooms failed the current simulation safety threshold"
+        if summary ~= Dungeon._lastUnsafe then
+            App.log(1, "DUNGEON", "no offered path passed the Dungeon curse filters and simulator: " .. summary)
+            Dungeon._lastUnsafe = summary
+        end
+    else
+        Dungeon._lastUnsafe = nil
+    end
+    Dungeon._pick = {sig = sig, x = best, rooms = offered}
+    return best
 end
 
 function Dungeon.roomName(tyb)
@@ -31054,8 +31415,10 @@ function Dungeon.shrine(Fzb, Gzb)
         table.insert(Jzb, tostring(Nzb and Nzb.name or Mzb.id))
         if Dungeon.isCurse(Mzb.id) then
             local Ozb, Pzb, Qzb = pcall(Dungeon.curseOk, Mzb.id, Fzb, Dungeon.cleared(Fzb) + 1, nil, Dungeon.rooms(Fzb))
-            if Ozb and not Pzb then
-                Kzb = Qzb
+            if not Ozb then
+                Kzb = "Shrine curse evaluation failed: " .. tostring(Pzb)
+            elseif not Pzb then
+                Kzb = Qzb or "Shrine curse rejected by the simulator"
             end
         else
             Izb = Izb + Dungeon.itemValue(Mzb.id, Fzb)
@@ -31505,6 +31868,13 @@ function Dungeon.enter(cCb, dCb, eCb)
     Dungeon._pick = nil
     local iCb = Dungeon.pick(cCb)
     if not iCb then
+        if # Dungeon.rooms(cCb) > 0 then
+            Dungeon.note("no offered Dungeon room passed the safety checks with this team; holding without taking an unapproved curse")
+            Modes.rec("dg").restUntil = os.time() + 1800
+            Brain.pending = nil
+            App.saveSoon()
+            return false
+        end
         Dungeon.logState(cCb, "no rooms on offer")
         local jCb, kCb, lCb = Dungeon.res(cCb)
         if kCb + lCb > 0 then
@@ -31519,6 +31889,18 @@ function Dungeon.enter(cCb, dCb, eCb)
     local mCb, nCb = pcall(Dungeon.planTeam, iCb, cCb, eCb)
     if not mCb then
         App.log(1, "ERROR", "dungeon team: " .. tostring(nCb))
+    end
+    -- The simulator may have auto-equipped a different team after the room
+    -- was scored. Recheck both current and next rooms using the NEW team.
+    local changedHazard = Dungeon.roomHazard(iCb, cCb)
+    local futureSafe, futureWhy = Dungeon.safeFuture(cCb, iCb)
+    if changedHazard or not futureSafe then
+        Dungeon.note("team changed or route became unsafe before entry: " .. tostring(changedHazard or futureWhy))
+        Dungeon._pick = nil
+        Modes.rec("dg").restUntil = os.time() + 45
+        Brain.pending = nil
+        App.saveSoon()
+        return false
     end
     if not eCb then
         local oCb = Brain.simTeam.dg
@@ -34540,7 +34922,6 @@ function Match.econ()
     local qWb = Match.wave()
     local rWb = math.max(0, Match.total - qWb)
     local sWb = Match.team
-    local tWb = 1
     local uWb = 1
     pcall(function()
         uWb = Core.USC.calculate_spawn_cost_multiplier(Core.session())
@@ -34588,6 +34969,7 @@ function Match.econ()
         local NWb = CWb [IWb.uuid] or {
         }
         local OWb = Match.trainee == IWb.uuid and Training.BONUS or 1
+        local unitUpgradeMult = 1
         if not MWb and # NWb > 0 then
             wWb = wWb + 1
         end
@@ -34599,9 +34981,14 @@ function Match.econ()
                 end
                 local SWb = LWb [RWb + 1]
                 if SWb and RWb < LWb.max then
-                    pcall(function()
-                        tWb = Core.USC.calculate_upgrade_cost_multiplier(QWb, Core.session())
+                    local okCost, rawMultiplier = pcall(function()
+                        return Core.USC.calculate_upgrade_cost_multiplier(QWb, Core.session())
                     end)
+                    local tWb = (okCost and type(rawMultiplier) == "number" and rawMultiplier == rawMultiplier and rawMultiplier > 0 and rawMultiplier < 1000000) and rawMultiplier or 1
+                    unitUpgradeMult = tWb
+                    if not okCost and FarmHub.every("upgradeCostFail", 60) then
+                        App.log(1, "ECONOMY", "cost multiplier unavailable; using independent ×1 fallback")
+                    end
                     local TWb = SWb.cost * tWb
                     if MWb then
                         local UWb = Units.farm(IWb.u, RWb + 1) - Units.farm(IWb.u, RWb)
@@ -34697,7 +35084,7 @@ function Match.econ()
                     train = OWb ~= 1 and (# NWb == 0 and "first" or "more") or nil
                 })
                 for fXb = 0, LWb.max do
-                    yWb = yWb + LWb [fXb].cost * (fXb == 0 and uWb or tWb)
+                    yWb = yWb + LWb [fXb].cost * (fXb == 0 and uWb or unitUpgradeMult)
                 end
             end
         end
@@ -34810,6 +35197,14 @@ function Match.econ()
             vWb = JXb
         end
     end
+    SynergyBrain.observe()
+    SynergyBrain.adjust(vWb, {
+        field = Match.mine,
+        sim = false,
+        money = pWb,
+        left = rWb,
+        income = xWb + (tonumber(Match.waveReward(math.min(Match.total, qWb + 1))) or 0)
+    })
     local MXb, NXb, OXb = Economy.decide(vWb, {
         money = pWb,
         left = rWb,
@@ -35357,7 +35752,6 @@ end
 Hunt.CARD_PICKS = {
     "Secret Luck",
     "Gems",
-    "Gems/Luck",
     "Easiest Win",
     "Smart"
 }
@@ -35379,16 +35773,7 @@ function Match.huntChoose(d0b, e0b)
     local g0b = (Match.pressure or 0) >= Config.safeReach or (Match.depth and Match.depth.leak)
     local h0b = Hunt.weatherStrength(Hunt.weatherNow())
     local i0b = table.find(Hunt.CARD_PICKS, Config.huntCards) and Config.huntCards or "Smart"
-    local gemLuckFocus = i0b == "Gems/Luck"
-    local partyCount = #Players:GetPlayers()
-    local matchmakingParty = Match.hunt == true and Config.mmEvent == true and partyCount > 1
-    local partyRewardFocus = matchmakingParty and (i0b == "Secret Luck" or i0b == "Gems" or gemLuckFocus)
-    -- Smart: in Summer matchmaking parties, skip solo safety veto but preserve difficulty scoring.
-    local smartMatchmaking = matchmakingParty and i0b == "Smart"
-    if matchmakingParty then
-        Match.huntHadParty = true
-    end
-    local j0b, k0b, l0b, m0b, bestLuck, bestEligible
+    local j0b, k0b, l0b, m0b
     local n0b = {
     }
     for o0b, p0b in pairs(d0b) do
@@ -35406,163 +35791,45 @@ function Match.huntChoose(d0b, e0b)
             q0b = q0b * Hunt.weatherStrength(p0b.weather) / math.max(0.05, h0b)
         end
         local v0b = type(p0b) == "table" and Hunt.cardGems(p0b, e0b) or 0
-        local w0b = partyRewardFocus or smartMatchmaking or q0b >= 1 or (Match.fhP * q0b >= f0b and not g0b)
+        local w0b = q0b >= 1 or (Match.fhP * q0b >= f0b and not g0b)
         local x0b = math.log(math.max(0.05, q0b))
         local y0b = x0b * Hunt.STRENGTH_GEMS + (w0b and v0b or - 1000)
         local z0b = Hunt.cardLuck(p0b)
-        if (i0b == "Secret Luck" or gemLuckFocus) and w0b and z0b > 0 then
+        if i0b == "Secret Luck" and w0b and z0b > 0 then
             y0b = 2e6 + z0b * 1e4 + v0b
-        elseif (i0b == "Gems" or gemLuckFocus) and w0b then
+        elseif i0b == "Gems" and w0b then
             y0b = 1e6 + v0b + x0b
         elseif i0b == "Easiest Win" then
             y0b = x0b * 1e6 + v0b
         end
-        local choose = not k0b or y0b > k0b
-        if j0b then
-            if i0b == "Easiest Win" then
-                -- Summer Hunt: any Secret Drop wins over a card without Secret Drop.
-                -- If both have Secret Drop, choose the highest amount first;
-                -- only if tied, choose the card that preserves more team strength.
-                -- If neither has Secret Drop, keep the original Easiest Win score.
-                local currentHasSecret = z0b > 0
-                local bestHasSecret = (bestLuck or 0) > 0
-                if currentHasSecret ~= bestHasSecret then
-                    choose = currentHasSecret
-                elseif currentHasSecret then
-                    if z0b ~= bestLuck then
-                        choose = z0b > bestLuck
-                    elseif q0b ~= l0b then
-                        choose = q0b > l0b
-                    else
-                        choose = v0b > m0b
-                    end
-                end
-            elseif partyRewardFocus then
-                if i0b == "Secret Luck" or gemLuckFocus then
-                    choose = z0b > bestLuck or (z0b == bestLuck and (v0b > m0b or (v0b == m0b and q0b > l0b)))
-                else
-                    choose = v0b > m0b or (v0b == m0b and q0b > l0b)
-                end
-            elseif gemLuckFocus then
-                if w0b ~= bestEligible then
-                    choose = w0b
-                elseif w0b then
-                    choose = z0b > bestLuck or (z0b == bestLuck and (v0b > m0b or (v0b == m0b and q0b > l0b)))
-                end
-            end
-        end
-        if choose then
+        if not k0b or y0b > k0b then
             j0b, k0b, l0b, m0b = o0b, y0b, q0b, v0b
-            bestLuck, bestEligible = z0b, w0b
         end
         table.insert(n0b, string.format("%s) %s%s [%s] ×%.2f, %d gems: %s", tostring(o0b), tostring(type(p0b) == "table" and p0b.title or "?"), (type(p0b) == "table" and p0b.weather) and (" (" .. tostring(p0b.weather) .. ")") or "", tostring(type(p0b) == "table" and p0b.option_type or "?"), q0b, math.floor(v0b + 0.5), table.concat(r0b, " + ")))
     end
-    return j0b, l0b, m0b, n0b, f0b, g0b, i0b, partyRewardFocus, partyCount
+    return j0b, l0b, m0b, n0b, f0b, g0b, i0b
 end
 
--- Folyah Summer: reliable Secret Drop vote 2026-11-22
--- Keep the cards available until the game's result event; retry only as necessary.
 function Match.huntPick(A0b)
-    local wave = Match.wave()
-    if Match.huntVoteDone == wave then
-        return true
+    local B0b = Match.wave()
+    local C0b, D0b, E0b, F0b, G0b, H0b, I0b = Match.huntChoose(A0b, B0b)
+    Match.fhP = Match.fhP * (D0b or 1)
+    Match.rogueOptions = nil
+    local J0b, K0b = pcall(HttpService.JSONEncode, HttpService, Hunt.plain(A0b))
+    if J0b then
+        Hunt.write("hunt_cards.txt", string.format("%s wave %d map %s weather %s: %s", os.date("%m-%d %H:%M"), B0b, tostring(Match.ld.map), tostring(Hunt.weatherNow()), K0b))
     end
-    if type(A0b) ~= "table" or not next(A0b) then
-        return false
-    end
-    local previous = Match.huntVote
-    -- The script checks every ~3 seconds; never override a recent vote with a blind vote.
-    if previous and previous.wave == wave and Utils.now() - previous.at < 9 then
-        return previous.sent == true
-    end
-
-    local chosen, power, reward, descriptions, floor, underPressure, focus, rewardFocus, partyCount = Match.huntChoose(A0b, wave)
-    if chosen == nil or type(A0b[chosen]) ~= "table" then
-        App.log(1, "ROGUE", "Summer: card scorer returned no valid option; no blind vote")
-        return false
-    end
-
-    local secret = Hunt.cardLuck(A0b[chosen])
-    -- The current scorer already prioritizes Secret Drop. This is a defensive
-    -- assertion that corrects any unexpected regression when the focus requires it.
-    if focus == "Easiest Win" or (focus == "Gems/Luck" and rewardFocus) then
-        local bestSlot, bestLuck = nil, secret
-        for slot, card in pairs(A0b) do
-            if type(card) == "table" then
-                local amount = Hunt.cardLuck(card)
-                if amount > bestLuck then
-                    bestSlot, bestLuck = slot, amount
-                end
-            end
-        end
-        if bestSlot then
-            App.log(1, "ROGUE", "WARNING: Secret Drop priority repaired; replaced card " .. tostring(chosen) .. " by " .. tostring(bestSlot))
-            chosen, secret = bestSlot, bestLuck
-            local updatedCard = A0b[chosen]
-            local correctedPower = 1
-            for _, effect in pairs(type(updatedCard.effects) == "table" and updatedCard.effects or {}) do
-                if type(effect) == "table" then
-                    correctedPower = correctedPower * Match.rogueEffect(effect)
-                end
-            end
-            if updatedCard.weather then
-                correctedPower = correctedPower * Hunt.weatherStrength(updatedCard.weather) / math.max(0.05, Hunt.weatherStrength(Hunt.weatherNow()))
-            end
-            power = correctedPower
-            reward = Hunt.cardGems(updatedCard, wave)
-        end
-    end
-
-    -- If retrying because of a network error or no result callback, reuse the
-    -- original card instead of switching to another choice mid-vote.
-    if previous and previous.wave == wave and A0b[previous.slot] then
-        chosen = previous.slot
-        secret = Hunt.cardLuck(A0b[chosen])
-    end
-
-    local firstAttempt = not previous or previous.wave ~= wave
-    if firstAttempt then
-        local okEncode, encoded = pcall(HttpService.JSONEncode, HttpService, Hunt.plain(A0b))
-        if okEncode then
-            Hunt.write("hunt_cards.txt", string.format("%s wave %d map %s weather %s: %s", os.date("%m-%d %H:%M"), wave, tostring(Match.ld.map), tostring(Hunt.weatherNow()), encoded))
-        end
-    end
-
-    local voteState = {
-        wave = wave,
-        slot = chosen,
-        at = Utils.now(),
-        luck = secret,
-        counted = previous and previous.wave == wave and previous.counted or false,
-        sent = false
-    }
-    Match.huntVote = voteState
-    local sent, response = App.request("rogue", "select_roguelike_option", chosen)
-    local acceptedTransport = sent == true and response ~= false
-    if acceptedTransport then
-        voteState.sent = true
-        if Match.huntVote == voteState and not voteState.counted then
-            Match.fhP = (Match.fhP or 1) * (power or 1)
-            voteState.counted = true
-        end
-    end
-    App.log(1, "ROGUE", string.format(
-        "Summer wave %d: %s option %s by %s (secret +%g; group %d; %s)",
-        wave, acceptedTransport and "VOTE SENT, group result pending" or "VOTE FAILED, will retry",
-        tostring(chosen), tostring(focus), secret, tonumber(partyCount) or #Players:GetPlayers(),
-        acceptedTransport and "cards retained" or tostring(response)))
-    -- IMPORTANT: do NOT set Match.rogueOptions=nil here.
-    return acceptedTransport
+    local L0b = App.request("rogue", "select_roguelike_option", C0b)
+    local M0b = C0b and Hunt.cardLuck(A0b [C0b]) or 0
+    App.log(1, "ROGUE", string.format("wave %d · picked %s by %s (worth %d gems%s, strength now ×%.2f, floor ×%.2f%s) of: %s", B0b, tostring(C0b), tostring(I0b), math.floor((E0b or 0) + 0.5), M0b > 0 and string.format(", secret luck +%g", M0b) or "", Match.fhP, G0b, H0b and ", under pressure" or "", table.concat(F0b, " | ")))
+    return L0b
 end
 
 function Match.huntRecord(N0b, O0b, P0b, Q0b)
     local R0b, S0b = pcall(Hunt.starfallRecord)
     Match.starSummary = R0b and S0b or nil
     local T0b = Hunt.floor()
-    local partyRun = Match.huntHadParty == true or (Config.mmEvent == true and #Players:GetPlayers() > 1)
-    if not partyRun then
-        Brain.hunt.pmin = Utils.clamp(T0b + (P0b and - 0.1 or 0.1), 0.4, 2)
-    end
+    Brain.hunt.pmin = Utils.clamp(T0b + (P0b and - 0.1 or 0.1), 0.4, 2)
     Brain.hunt.runs = Brain.hunt.runs or {
     }
     table.insert(Brain.hunt.runs, 1, {
@@ -35573,7 +35840,6 @@ function Match.huntRecord(N0b, O0b, P0b, Q0b)
         mult = Match.fhMult or 1,
         strength = Match.fhP or 1,
         floor = T0b,
-        party = partyRun,
         map = Match.ld.map,
         weather = Hunt.weatherNow(),
         sec = Q0b,
@@ -35615,24 +35881,8 @@ end
 
 function Match.pickRogue()
     local b1b = Match.rogueOptions
-    if Match.hunt then
-        local wave = Match.wave()
-        if Match.huntVoteDone == wave then
-            return true
-        end
-        if Match.huntVote and Match.huntVote.wave ~= wave then
-            -- Stale cards belong to a previous wave; do not cast a random vote.
-            Match.huntVote = nil
-            Match.rogueOptions = nil
-            b1b = nil
-        end
-        if type(b1b) == "table" and next(b1b) then
-            return Match.huntPick(b1b)
-        end
-        if FarmHub.every("summerMissingCards", 12) then
-            App.log(1, "ROGUE", "Summer: voting open but card options not received; waiting instead of blindly voting card 1")
-        end
-        return false
+    if b1b and Match.hunt then
+        return Match.huntPick(b1b)
     end
     if not b1b then
         local c1b = App.request("rogue", "select_roguelike_option", 1)
@@ -37926,11 +38176,9 @@ function Match.finish()
         end
     end
     local Bec = nil
-    if not Config.manualOnly then
-        pcall(function()
-            Bec = Modes.pick()
-        end)
-    end
+    pcall(function()
+        Bec = Modes.pick()
+    end)
     if Bec and Bec.kind == "story" and Bec.first and xec and Bec.level ~= xec and not Brain.nextMode then
         for Cec, Dec in ipairs(Modes.lastScored or {
         }) do
@@ -37940,7 +38188,7 @@ function Match.finish()
             end
         end
     end
-    if not Config.manualOnly and not Bec and xec and Config.onlyStory and (Config.pickStory == "" or Config.pickStory == "progress") and Match.ld._difficulty == "Normal" and not Modes.done((Core.prof() or {
+    if not Bec and xec and Config.onlyStory and (Config.pickStory == "" or Config.pickStory == "progress") and Match.ld._difficulty == "Normal" and not Modes.done((Core.prof() or {
     }).level_data or {
     }, xec, "Normal") then
         local Eec = "st:" .. xec .. ":Normal"
@@ -37958,28 +38206,6 @@ function Match.finish()
     local Hec = (Match.ld._gamemode == "story" or Match.ld._gamemode == "infinite" or (Match.kind == "event" and Match.ld._OVERRIDE_CAN_REPLAY)) and _cc
     if not Config.play or not Config.master then
         Fec, Gec = "stay", "Auto Play is off"
-    elseif Config.manualOnly then
-        -- Manual Play never calls Modes.pick(). Next means ONLY the next Story act
-        -- or the next room of the Dungeon the player entered manually.
-        -- If both options are on, Next wins; Replay is a fallback.
-        local canManualReplay = Match.ld._gamemode == "story" or Match.ld._gamemode == "infinite"
-            or (Match.kind == "event" and Match.ld._OVERRIDE_CAN_REPLAY)
-        local canManualStoryNext = Config.manualNext and _cc and Match.ld._is_actual_storymode
-            and xec and Modes.open(xec)
-        local canManualDungeonNext = Config.manualNext and _cc and Match.kind == "dungeon"
-        if canManualStoryNext then
-            Fec, Gec = "next_story", "Manual Play: next unlocked Story act"
-        elseif canManualDungeonNext then
-            Fec, Gec = "lobby", "Manual Play: continuing the current Dungeon to the next room"
-        elseif Config.manualReplay and canManualReplay then
-            Fec, Gec = "replay", "Manual Play: replaying the same stage if the game accepts"
-        elseif not Config.manualReplay and not Config.manualNext then
-            Fec, Gec = "stay", "Manual Play: Replay and Next off; waiting on the result screen"
-        elseif Config.manualReplay then
-            Fec, Gec = "lobby", "Manual Play: this stage has no Replay; choose another manually"
-        else
-            Fec, Gec = "stay", "Manual Play: no available Next; waiting on the result screen"
-        end
     elseif Bec and Bec.key == bdc and Hec then
         Fec, Gec = "replay", "replaying: still the best mode"
     elseif Bec and Bec.kind == "story" and Match.ld._is_actual_storymode and _cc then
@@ -38021,7 +38247,7 @@ function Match.finish()
         }).name or Brain.buyOnce.item) .. " you agreed"
     end
     local Pec
-    if not Config.manualOnly and ((Match.kind == "dungeon" and _cc) or Fec == "next_story" or Fec == "replay") and Fec ~= "stay" then
+    if ((Match.kind == "dungeon" and _cc) or Fec == "next_story" or Fec == "replay") and Fec ~= "stay" then
         local Qec, Rec = pcall(Strategy.hasWork)
         if Qec then
             Pec = Rec
@@ -38032,7 +38258,7 @@ function Match.finish()
             Fec, Gec = "lobby", "lobby: the Units → Upgrades can " .. tostring(Pec)
         end
     end
-    if Match.kind == "dungeon" and Fec ~= "stay" and ((Config.manualOnly and Config.manualNext) or (not Config.manualOnly and Bec and Bec.key == "dg")) and _cc and # Units.equipped() >= 6 and not Brain.holdLobby and not Brain.buyStorage and not Pec then
+    if Match.kind == "dungeon" and Fec ~= "stay" and Bec and Bec.key == "dg" and _cc and # Units.equipped() >= 6 and not Brain.holdLobby and not Brain.buyStorage and not Pec then
         Brain.pending = nil
         App.saveNow()
         App.status("Match", "next dungeon room")
@@ -38046,7 +38272,7 @@ function Match.finish()
         Brain.startTeam = nil
         Fec, Gec = "lobby", "lobby: the next dungeon room didn't start from here"
     end
-    Brain.pending = (Fec == "replay" or Fec == "next_story") and Bec and {
+    Brain.pending = (Fec == "replay" or Fec == "next_story") and {
         key = Bec.key,
         kind = Bec.kind,
         level = Bec.level,
@@ -38054,7 +38280,7 @@ function Match.finish()
         label = Bec.label,
         at = os.time()
     } or nil
-    if (Fec == "next_story" or Fec == "replay") and Bec then
+    if Fec == "next_story" or Fec == "replay" then
         Brain.startTeam = {
             train = {
                 key = Bec.key,
@@ -38412,9 +38638,6 @@ function Match.run()
     Match.buildCandidates()
     Match.random = Match.ld._randomequippedmode ~= nil or Core.session().override_equipped_units ~= nil
     Match.hunt = Hunt.is(Match.ld.id)
-    Match.huntHadParty = false
-    Match.huntVote = nil
-    Match.huntVoteDone = nil
     if not Match.random then
         local vgc, wgc = pcall(Match.startTeam)
         if not vgc then
@@ -38606,29 +38829,9 @@ function Match.run()
     end))
     table.insert(App.conns, mhc.show_roguelike_options.OnClientEvent:Connect(function(ohc, phc)
         Match.rogueOptions = phc
-        if Match.hunt and type(phc) == "table" then
-            if Match.huntVoteDone ~= Match.wave() then
-                -- New cards: the same vote can be retried, but not overridden.
-                if not (Match.huntVote and Match.huntVote.wave == Match.wave()) then
-                    Match.huntVote = nil
-                end
-            else
-                -- A new set of cards means a new vote, even if the wave number repeats.
-                Match.huntVoteDone = nil
-                Match.huntVote = nil
-            end
-        end
     end))
     if mhc:FindFirstChild("show_roguelike_vote_result") then
         table.insert(App.conns, mhc.show_roguelike_vote_result.OnClientEvent:Connect(function(qhc, rhc)
-            if Match.hunt then
-                local vote = Match.huntVote
-                local winner = type(qhc) == "table" and (qhc.title or qhc.name or qhc.id or "unknown") or tostring(qhc)
-                App.log(1, "ROGUE", string.format("Summer wave %d RESULT: my option %s (secret +%g); group picked %s", Match.wave(), vote and tostring(vote.slot) or "unknown", vote and (tonumber(vote.luck) or 0) or 0, tostring(winner)))
-                Match.huntVoteDone = Match.wave()
-                Match.huntVote = nil
-                Match.rogueOptions = nil
-            end
             if type(rhc) == "table" then
                 Match.fhMult = 1 + (tonumber(rhc.candy_multiplier) or 0)
                 local shc, thc = {
@@ -41140,35 +41343,8 @@ function GUI.build()
     Yrc(bsc, "Turn it on and watch it work. Every other tab is for when you want to choose something yourself.")
     vrc.master = bsc:Toggle("Auto Farm", "Picks the modes, plays them and runs your picks. Off: it plays nothing, but the summons, fuses and stars you switched on still run in the lobby", Config.master, function(csc)
         xrc("master", csc)
-        urc:Status(csc and (Config.manualOnly and "🎮 Manual Play" or "▶ Farming") or "⏸ Paused")
+        urc:Status(csc and "▶ Farming" or "⏸ Paused")
     end)
-    vrc.manualOnly = bsc:Toggle("Manual Play Only",
-        "Choose and enter the stage yourself. RobScript plays the battle without choosing any other stage. Configure Replay and Next using the two switches below.",
-        Config.manualOnly, function(enabled)
-            xrc("manualOnly", enabled)
-            if enabled then
-                Brain.pending = nil
-                Brain.startTeam = nil
-                Modes.lastScored = nil
-                App.log(1, "MODE", "Manual Play ON: no automatic stage selection; join a stage yourself")
-            else
-                App.log(1, "MODE", "Manual Play OFF: original automatic mode selection restored")
-            end
-            urc:Status(enabled and (Config.master and "🎮 Manual Play" or "⏸ Auto Farm is off") or (Config.master and "▶ Farming" or "⏸ Paused"))
-            App.saveSoon()
-        end)
-    vrc.manualReplay = bsc:Toggle("Manual Auto Replay",
-        "Manual Play only: repeat the same stage after a match if the game supports Replay. When Next is also ON, Next has priority.",
-        Config.manualReplay, function(enabled)
-            xrc("manualReplay", enabled)
-            App.log(1, "MODE", "Manual Replay " .. (enabled and "ON" or "OFF"))
-        end)
-    vrc.manualNext = bsc:Toggle("Manual Auto Next",
-        "Manual Play only: on victory advance to the next unlocked Story act, or continue the current Dungeon to its next room. Never chooses unrelated modes. Next wins over Replay if both are ON.",
-        Config.manualNext, function(enabled)
-            xrc("manualNext", enabled)
-            App.log(1, "MODE", "Manual Next " .. (enabled and "ON" or "OFF"))
-        end)
     bsc:Section("Right now")
     GUI.nowCard = bsc:StatusCard({
         icon = "⏳",
@@ -41283,6 +41459,10 @@ function GUI.build()
     }, "onlyDungeons")
     wrc.dungeon = bsc:Paragraph("…")
     Arc(bsc, "Start New Dungeon Runs", "Starts a new run when the last one is over", "dungeonStart")
+    bsc:Section("Dungeon Curse Bans")
+    Arc(bsc, "Ban Regen", "OFF by default: allow Regen and Super Regen; when enabled, block these curses in rooms, Shrines and visible future routes.", "dungeonBanRegen")
+    Arc(bsc, "Ban Flight", "ON by default: block Flight curses and Flying Enemies challenge rooms, including visible future routes. Shrines block only the banned curse.", "dungeonBanFlight")
+    Arc(bsc, "Ban Random Curse", "ON by default: block Random Curse in rooms, Shrines and visible future routes; other curses remain evaluated by the simulator.", "dungeonBanRandom")
     bsc:Section("Challenges")
     dsc("Challenges", "The Daily Challenge (gems, a Divine Wish, Star Remnants, Stat Cubes) and the 30-minute challenge", {
         "dailyChallenge",
@@ -41352,7 +41532,7 @@ function GUI.build()
         end
         if Msc and Msc.hunt then
             wrc.hunt = bsc:Paragraph("…")
-            vrc.huntCardsPick = bsc:Dropdown("Card Pick", "Vote priority: Secret Luck, Gems, Gems/Luck, Easiest Win or Smart. Summer matchmaking parties of 2+ ignore the solo safety veto for reward-focused options", Hunt.CARD_PICKS, table.find(Hunt.CARD_PICKS, Config.huntCards) or 1, function(Nsc)
+            vrc.huntCardsPick = bsc:Dropdown("Card Pick", "Which of the 3 cards to take each time. None that risks losing the run", Hunt.CARD_PICKS, table.find(Hunt.CARD_PICKS, Config.huntCards) or 1, function(Nsc)
                 xrc("huntCards", Nsc)
             end)
             Arc(bsc, "Smart Charm Equip", "Wears the Summer Charm that helps most before a Summer Hunt or a Sky portal: more rewards where your team wins with room to spare, more damage where it might lose", "smartCharm")
